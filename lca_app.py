@@ -153,6 +153,8 @@ def fit_lca(data: np.ndarray, n_classes: int, max_iter: int = 100, tol: float = 
 
 def compute_tetrachoric_single(x: np.ndarray, y: np.ndarray) -> float:
     """Compute tetrachoric correlation between two binary variables."""
+    from scipy.stats import multivariate_normal
+    
     a = np.sum((x == 1) & (y == 1))
     b = np.sum((x == 1) & (y == 0))
     c = np.sum((x == 0) & (y == 1))
@@ -174,11 +176,13 @@ def compute_tetrachoric_single(x: np.ndarray, y: np.ndarray) -> float:
     pobs = a / n
     
     def objective(rho):
-        from scipy.stats import mvn
-        lower = np.array([-np.inf, -np.inf])
+        # Use multivariate_normal.cdf for bivariate normal probability
         upper = np.array([h1, h2])
-        corr = np.array([[1, rho], [rho, 1]])
-        p, _ = mvn.mvnun(lower, upper, np.zeros(2), corr)
+        cov = np.array([[1, rho], [rho, 1]])
+        try:
+            p = multivariate_normal.cdf(upper, mean=np.zeros(2), cov=cov)
+        except:
+            return 1.0  # Return high error if computation fails
         return (p - pobs) ** 2
     
     result = minimize_scalar(objective, bounds=(-0.99, 0.99), method='bounded')
