@@ -18,14 +18,32 @@ from plotly.subplots import make_subplots
 import warnings
 warnings.filterwarnings('ignore')
 
+# Configure PyTensor to avoid C compilation issues on macOS (especially Apple Silicon)
+# This must be done BEFORE importing PyMC
+import os
+os.environ.setdefault("PYTENSOR_FLAGS", "device=cpu,floatX=float64,optimizer=fast_compile,cxx=")
+
+# Check for prince (MCA) availability
+PRINCE_AVAILABLE = False
+try:
+    import prince
+    PRINCE_AVAILABLE = True
+except ImportError:
+    pass
+
 # Check for PyMC availability
 PYMC_AVAILABLE = False
+PYMC_ERROR = None
 try:
+    import pytensor
+    
     import pymc as pm
     import arviz as az
     PYMC_AVAILABLE = True
-except ImportError:
-    pass
+except ImportError as e:
+    PYMC_ERROR = str(e)
+except Exception as e:
+    PYMC_ERROR = str(e)
 
 
 # =============================================================================
@@ -248,8 +266,10 @@ def factor_analysis_principal_axis(corr_matrix: np.ndarray, n_factors: int,
     
     loadings_rotated = varimax_rotation(loadings)
     
+    # Variance explained - relative importance of each factor
+    total_var = np.sum(loadings_rotated ** 2)
     var_explained = np.sum(loadings_rotated ** 2, axis=0)
-    var_explained_pct = var_explained / n_items * 100
+    var_explained_pct = (var_explained / total_var * 100) if total_var > 0 else np.zeros(n_factors)
     
     return {
         'loadings': loadings_rotated,
@@ -365,8 +385,11 @@ def fit_bayesian_factor_model_vi(data: np.ndarray, n_factors: int, max_iter: int
             break
     
     loadings_rotated = varimax_rotation(mu_lambda)
+    
+    # Variance explained - relative importance of each factor
+    total_var = np.sum(loadings_rotated ** 2)
     var_explained = np.sum(loadings_rotated ** 2, axis=0)
-    var_explained_pct = var_explained / n_items * 100
+    var_explained_pct = (var_explained / total_var * 100) if total_var > 0 else np.zeros(n_factors)
     
     return {
         'loadings': loadings_rotated,
@@ -380,78 +403,199 @@ def fit_bayesian_factor_model_vi(data: np.ndarray, n_factors: int, max_iter: int
 
 
 # =============================================================================
-# BAYESIAN FACTOR MODEL (PyMC)
+# BAYESIAN FACTOR MODEL (PyMC) - PROPERLY IDENTIFIED
 # =============================================================================
 
 def fit_bayesian_factor_model_pymc(data: np.ndarray, n_factors: int, 
-                                    n_samples: int = 1000, n_tune: int = 500,
+                                    n_samples: int = 1000, n_tune: int = 1000,
                                     seed: int = 42) -> dict:
     """
     Bayesian Factor Model for binary data using PyMC.
     
+    Uses a properly identified parameterization to avoid divergences:
+    1. Lower triangular loadings matrix with positive diagonal (fixes rotation)
+    2. Non-centered parameterization for latent factors
+    3. Regularizing priors on loadings
+    
     Model:
-        z_i ~ N(0, I)                      # Latent factors for household i
-        lambda_jk ~ N(0, 1)                # Factor loadings
-        P(x_ij = 1) = Phi(sum_k lambda_jk * z_ik + alpha_j)
-        
-    This is a probit factor model with proper MCMC inference.
+        z_i ~ N(0, I)                           # Latent factors for household i
+        Lambda = LowerTriangular(positive_diag) # Identified loadings matrix  
+        P(x_ij = 1) = Phi(alpha_j + [z_i @ Lambda.T]_j)
     """
     if not PYMC_AVAILABLE:
         raise ImportError("PyMC is not installed. Install with: pip install pymc arviz")
     
     n_obs, n_items = data.shape
     
+    # Ensure we don't have more factors than can be identified
+    max_factors = n_items
+    if n_factors > max_factors:
+        n_factors = max_factors
+        st.warning(f"Reduced factors to {max_factors} for identification")
+    
     with pm.Model() as factor_model:
-        # Priors for factor loadings (items x factors)
-        # Use hierarchical prior for regularization
-        loading_sd = pm.HalfNormal('loading_sd', sigma=1.0)
-        loadings = pm.Normal('loadings', mu=0, sigma=loading_sd, 
-                            shape=(n_items, n_factors))
+        # === IDENTIFIED LOADINGS PARAMETERIZATION ===
+        # Use lower triangular structure with positive diagonal
+        # This removes rotation invariance and sign ambiguity
         
-        # Intercepts for each item (baseline purchase probability)
-        alpha = pm.ZeroSumNormal('alpha', sigma=2, shape=n_items)
+        # Number of free parameters in lower triangular loadings
+        # First factor: item 0 only (positive)
+        # Second factor: items 0-1 (item 1 positive on diagonal)
+        # etc.
         
-        # Latent factors for each observation (obs x factors)
-        # Standard normal prior for identification
+        # Diagonal elements (positive, one per factor)
+        # These are the "anchor" loadings that identify each factor
+        diag_loadings = pm.HalfNormal('diag_loadings', sigma=1.0, shape=n_factors)
+        
+        # Off-diagonal elements in the lower triangular part
+        # For factor k, items k+1 to n_items-1 can load on it
+        n_offdiag = sum(n_items - k - 1 for k in range(n_factors))
+        
+        if n_offdiag > 0:
+            offdiag_loadings = pm.Normal('offdiag_loadings', mu=0, sigma=0.5, 
+                                         shape=n_offdiag)
+        
+        # Build the loadings matrix
+        # Lambda[i,k] is the loading of item i on factor k
+        # Constraint: Lambda[i,k] = 0 for i < k (upper triangular zeros)
+        # Lambda[k,k] > 0 (positive diagonal)
+        
+        def build_loadings_matrix(diag, offdiag, n_items, n_factors):
+            """Build lower triangular loadings matrix with positive diagonal."""
+            Lambda = np.zeros((n_items, n_factors))
+            offdiag_idx = 0
+            
+            for k in range(n_factors):
+                # Diagonal element (positive)
+                Lambda[k, k] = diag[k]
+                
+                # Off-diagonal elements (items below the diagonal)
+                for i in range(k + 1, n_items):
+                    if n_offdiag > 0:
+                        Lambda[i, k] = offdiag[offdiag_idx]
+                        offdiag_idx += 1
+            
+            return Lambda
+        
+        # Build loadings using pytensor ops
+        import pytensor.tensor as pt
+        
+        Lambda = pt.zeros((n_items, n_factors))
+        offdiag_idx = 0
+        
+        for k in range(n_factors):
+            # Set diagonal
+            Lambda = pt.set_subtensor(Lambda[k, k], diag_loadings[k])
+            
+            # Set off-diagonal
+            for i in range(k + 1, n_items):
+                if n_offdiag > 0:
+                    Lambda = pt.set_subtensor(Lambda[i, k], offdiag_loadings[offdiag_idx])
+                    offdiag_idx += 1
+        
+        # === LATENT FACTORS (Non-centered parameterization) ===
+        # z_raw ~ N(0, 1), then z = z_raw (already standard normal)
         z = pm.Normal('z', mu=0, sigma=1, shape=(n_obs, n_factors))
         
-        # Linear predictor: alpha_j + sum_k(lambda_jk * z_ik)
-        # Shape: (n_obs, n_items)
-        linear_pred = alpha + pm.math.dot(z, loadings.T)
+        # === INTERCEPTS ===
+        # Item intercepts (baseline log-odds of purchase)
+        # Slightly informative prior centered on typical purchase rates
+        alpha = pm.Normal('alpha', mu=0, sigma=1.5, shape=n_items)
         
-        # Probit link: P(x=1) = Phi(linear_pred)
-        p = pm.math.invprobit(linear_pred)
+        # === LINEAR PREDICTOR ===
+        # eta_ij = alpha_j + sum_k(z_ik * Lambda_jk)
+        eta = alpha + pm.math.dot(z, Lambda.T)
         
-        # Likelihood
+        # === LIKELIHOOD ===
+        # Probit link: P(x=1) = Phi(eta)
+        p = pm.math.invprobit(eta)
+        
+        # Observed data
         y_obs = pm.Bernoulli('y_obs', p=p, observed=data)
         
-        # Sample
-        trace = pm.sample(n_samples, tune=n_tune, random_seed=seed,
-                         return_inferencedata=True, progressbar=True,
-                         nuts_sampler='nutpie', target_accept=0.9)  # Use 1 core for Streamlit compatibility
-        trace = pm.compute_log_likelihood(trace)
+        # === SAMPLING ===
+        # Use nutpie if available, otherwise standard NUTS
+        try:
+            import nutpie
+            trace = pm.sample(
+                n_samples, 
+                tune=n_tune, 
+                random_seed=seed,
+                return_inferencedata=True, 
+                progressbar=True,
+                nuts_sampler="nutpie",
+                target_accept=0.9
+            )
+        except (ImportError, Exception):
+            # Fallback to standard PyMC sampler
+            trace = pm.sample(
+                n_samples, 
+                tune=n_tune, 
+                random_seed=seed,
+                return_inferencedata=True, 
+                progressbar=True,
+                cores=1,
+                target_accept=0.9,
+                compile_kwargs={"mode": "FAST_COMPILE"}
+            )
     
-    # Extract posterior means
-    loadings_mean = trace.posterior['loadings'].mean(dim=['chain', 'draw']).values
+    # === EXTRACT RESULTS ===
+    # Reconstruct full loadings matrix from posterior
+    diag_mean = trace.posterior['diag_loadings'].mean(dim=['chain', 'draw']).values
+    
+    if n_offdiag > 0:
+        offdiag_mean = trace.posterior['offdiag_loadings'].mean(dim=['chain', 'draw']).values
+        offdiag_std = trace.posterior['offdiag_loadings'].std(dim=['chain', 'draw']).values
+    else:
+        offdiag_mean = np.array([])
+        offdiag_std = np.array([])
+    
+    diag_std = trace.posterior['diag_loadings'].std(dim=['chain', 'draw']).values
+    
+    # Build posterior mean loadings matrix
+    loadings_mean = np.zeros((n_items, n_factors))
+    loadings_std = np.zeros((n_items, n_factors))
+    offdiag_idx = 0
+    
+    for k in range(n_factors):
+        loadings_mean[k, k] = diag_mean[k]
+        loadings_std[k, k] = diag_std[k]
+        
+        for i in range(k + 1, n_items):
+            if n_offdiag > 0:
+                loadings_mean[i, k] = offdiag_mean[offdiag_idx]
+                loadings_std[i, k] = offdiag_std[offdiag_idx]
+                offdiag_idx += 1
+    
     alpha_mean = trace.posterior['alpha'].mean(dim=['chain', 'draw']).values
+    alpha_std = trace.posterior['alpha'].std(dim=['chain', 'draw']).values
     z_mean = trace.posterior['z'].mean(dim=['chain', 'draw']).values
     
-    # Posterior standard deviations
-    loadings_std = trace.posterior['loadings'].std(dim=['chain', 'draw']).values
-    alpha_std = trace.posterior['alpha'].std(dim=['chain', 'draw']).values
+    # Variance explained - compute as proportion of total loading variance
+    # This gives relative importance of each factor (sums to 100%)
+    total_loading_var = np.sum(loadings_mean ** 2)
+    var_explained = np.sum(loadings_mean ** 2, axis=0)
+    if total_loading_var > 0:
+        var_explained_pct = var_explained / total_loading_var * 100
+    else:
+        var_explained_pct = np.zeros(n_factors)
     
-    # Apply varimax rotation to posterior mean loadings
-    loadings_rotated = varimax_rotation(loadings_mean)
+    # Model diagnostics
+    try:
+        waic = az.waic(trace)
+    except Exception:
+        waic = None
     
-    # Variance explained
-    var_explained = np.sum(loadings_rotated ** 2, axis=0)
-    var_explained_pct = var_explained / n_items * 100
-    
-    # Compute WAIC for model comparison
-    waic = az.waic(trace)
+    # Sampling diagnostics
+    try:
+        summary = az.summary(trace, var_names=['diag_loadings', 'alpha'])
+        n_divergences = trace.sample_stats.diverging.sum().values
+    except Exception:
+        summary = None
+        n_divergences = 0
     
     return {
-        'loadings': loadings_rotated,
+        'loadings': loadings_mean,
         'loadings_std': loadings_std,
         'alpha': alpha_mean,
         'alpha_std': alpha_std,
@@ -460,7 +604,9 @@ def fit_bayesian_factor_model_pymc(data: np.ndarray, n_factors: int,
         'var_explained_pct': var_explained_pct,
         'trace': trace,
         'waic': waic,
-        'n_factors': n_factors
+        'n_factors': n_factors,
+        'n_divergences': int(n_divergences),
+        'summary': summary
     }
 
 
@@ -491,10 +637,7 @@ def fit_discrete_choice_model_pymc(purchase_data: np.ndarray,
         - gamma: Coefficients for product features (shared across households)
         - Random effects: Optional household random effects
     
-    This allows us to understand:
-        - Which household characteristics drive purchases of specific products
-        - How product attributes affect overall purchase probability
-        - Substitution patterns through correlated random effects
+    Uses non-centered parameterization for hierarchical effects to reduce divergences.
     """
     if not PYMC_AVAILABLE:
         raise ImportError("PyMC is not installed. Install with: pip install pymc arviz")
@@ -527,46 +670,37 @@ def fit_discrete_choice_model_pymc(purchase_data: np.ndarray,
     
     with pm.Model() as choice_model:
         # Product intercepts (baseline purchase probabilities)
-        alpha = pm.Normal('alpha', mu=0, sigma=2, shape=n_items)
+        # Slightly tighter prior
+        alpha = pm.Normal('alpha', mu=0, sigma=1.5, shape=n_items)
         
         # Initialize linear predictor with intercepts
-        # Shape will be (n_obs, n_items)
-        linear_pred = pm.math.zeros((n_obs, n_items)) + alpha
+        linear_pred = alpha.reshape((1, n_items))  # Broadcast-ready shape
         
-        # Household feature effects (product-specific)
+        # Household feature effects (product-specific) - NON-CENTERED
         if has_hh_features:
-            # Hierarchical prior: beta_j ~ N(mu_beta, sigma_beta)
-            mu_beta = pm.Normal('mu_beta', mu=0, sigma=1, shape=n_hh_features)
-            sigma_beta = pm.HalfNormal('sigma_beta', sigma=1, shape=n_hh_features)
+            # Hierarchical prior with non-centered parameterization
+            mu_beta = pm.Normal('mu_beta', mu=0, sigma=0.5, shape=n_hh_features)
+            sigma_beta = pm.HalfNormal('sigma_beta', sigma=0.5, shape=n_hh_features)
             
-            # Product-specific coefficients for household features
-            # Shape: (n_items, n_hh_features)
-            beta = pm.Normal('beta', mu=mu_beta, sigma=sigma_beta, 
-                           shape=(n_items, n_hh_features))
+            # Non-centered: beta_raw ~ N(0,1), then beta = mu + sigma * beta_raw
+            beta_raw = pm.Normal('beta_raw', mu=0, sigma=1, 
+                                shape=(n_items, n_hh_features))
+            beta = pm.Deterministic('beta', mu_beta + sigma_beta * beta_raw)
             
-            # Add to linear predictor: X @ beta.T
-            # X: (n_obs, n_hh_features), beta: (n_items, n_hh_features)
-            # Result: (n_obs, n_items)
+            # Add to linear predictor
             linear_pred = linear_pred + pm.math.dot(X, beta.T)
         
         # Product feature effects (shared across households)
         if has_prod_features:
-            # Coefficients for product features
-            gamma = pm.Normal('gamma', mu=0, sigma=1, shape=n_prod_features)
-            
-            # Product feature contribution (same for all households)
-            # Z: (n_items, n_prod_features), gamma: (n_prod_features,)
-            # Result: (n_items,) -> broadcast to (n_obs, n_items)
+            gamma = pm.Normal('gamma', mu=0, sigma=0.5, shape=n_prod_features)
             prod_effect = pm.math.dot(Z, gamma)
             linear_pred = linear_pred + prod_effect
         
-        # Optional: Household random effects (captures unobserved heterogeneity)
+        # Optional: Household random effects - NON-CENTERED
         if include_random_effects:
-            # Household-level random intercept
-            sigma_hh = pm.HalfNormal('sigma_hh', sigma=1)
-            hh_effect = pm.Normal('hh_effect', mu=0, sigma=sigma_hh, shape=n_obs)
-            
-            # Add household effect (same across all products for each household)
+            sigma_hh = pm.HalfNormal('sigma_hh', sigma=0.5)
+            hh_effect_raw = pm.Normal('hh_effect_raw', mu=0, sigma=1, shape=n_obs)
+            hh_effect = pm.Deterministic('hh_effect', sigma_hh * hh_effect_raw)
             linear_pred = linear_pred + hh_effect[:, None]
         
         # Logistic link function
@@ -575,11 +709,30 @@ def fit_discrete_choice_model_pymc(purchase_data: np.ndarray,
         # Likelihood
         y_obs = pm.Bernoulli('y_obs', p=p, observed=purchase_data)
         
-        # Sample
-        trace = pm.sample(n_samples, tune=n_tune, random_seed=seed,
-                         return_inferencedata=True, progressbar=True,
-                         nuts_sampler='nutpie', target_accept=0.9) 
-        trace = pm.compute_log_likelihood(trace)
+        # Sample - try nutpie first, fall back to standard
+        try:
+            import nutpie
+            trace = pm.sample(
+                n_samples, 
+                tune=n_tune, 
+                random_seed=seed,
+                return_inferencedata=True, 
+                progressbar=True,
+                nuts_sampler="nutpie",
+                target_accept=0.9
+            )
+        except (ImportError, Exception):
+            trace = pm.sample(
+                n_samples, 
+                tune=n_tune, 
+                random_seed=seed,
+                return_inferencedata=True, 
+                progressbar=True,
+                cores=1,
+                target_accept=0.9,
+                compile_kwargs={"mode": "FAST_COMPILE"}
+            )
+    
     # Extract results
     results = {
         'alpha': trace.posterior['alpha'].mean(dim=['chain', 'draw']).values,
@@ -588,6 +741,12 @@ def fit_discrete_choice_model_pymc(purchase_data: np.ndarray,
         'n_items': n_items,
         'product_names': product_names
     }
+    
+    # Divergence count
+    try:
+        results['n_divergences'] = int(trace.sample_stats.diverging.sum().values)
+    except Exception:
+        results['n_divergences'] = 0
     
     if has_hh_features:
         results['beta'] = trace.posterior['beta'].mean(dim=['chain', 'draw']).values
@@ -602,14 +761,16 @@ def fit_discrete_choice_model_pymc(purchase_data: np.ndarray,
     
     if include_random_effects:
         results['hh_effect'] = trace.posterior['hh_effect'].mean(dim=['chain', 'draw']).values
-        results['sigma_hh'] = trace.posterior['sigma_hh'].mean(dim=['chain', 'draw']).values
+        results['sigma_hh'] = float(trace.posterior['sigma_hh'].mean(dim=['chain', 'draw']).values)
     
     # Model diagnostics
-    results['waic'] = az.waic(trace)
+    try:
+        results['waic'] = az.waic(trace)
+    except Exception:
+        results['waic'] = None
     
     # Compute predicted probabilities
-    alpha_samples = trace.posterior['alpha'].values.reshape(-1, n_items)
-    pred_probs = 1 / (1 + np.exp(-results['alpha']))  # Baseline using posterior means
+    pred_probs = 1 / (1 + np.exp(-results['alpha']))
     results['predicted_probs'] = pred_probs
     
     return results
@@ -674,6 +835,215 @@ def fit_nmf(data: np.ndarray, n_components: int, max_iter: int = 200,
         'n_components': n_components,
         'n_iter': iteration + 1
     }
+
+
+# =============================================================================
+# MULTIPLE CORRESPONDENCE ANALYSIS (MCA) using prince
+# =============================================================================
+
+def fit_mca(data: np.ndarray, n_components: int, product_names: list = None) -> dict:
+    """
+    Multiple Correspondence Analysis for binary purchase data using prince.
+    
+    MCA is essentially PCA for categorical/binary data. It's appropriate for 
+    0/1 purchase matrices because:
+    - No normality assumptions
+    - Handles binary data natively via indicator matrix expansion
+    - Reveals co-purchase patterns as latent dimensions
+    - Dimensions can be interpreted as shopping "styles" or product affinities
+    
+    Returns:
+        - Column coordinates: Product positions in latent space
+        - Row coordinates: Household positions in latent space  
+        - Eigenvalues/inertia: Variance explained by each dimension
+        - Contributions: How much each product contributes to each dimension
+    """
+    if not PRINCE_AVAILABLE:
+        raise ImportError("prince is not installed. Install with: pip install prince")
+    
+    n_obs, n_items = data.shape
+    
+    # Create DataFrame with proper column names
+    if product_names is None:
+        product_names = [f"item_{i}" for i in range(n_items)]
+    
+    df = pd.DataFrame(data.astype(int), columns=product_names)
+    
+    # Convert to categorical (required for MCA)
+    for col in df.columns:
+        df[col] = df[col].astype(str)
+    
+    # Fit MCA
+    mca = prince.MCA(
+        n_components=n_components,
+        n_iter=10,
+        copy=True,
+        check_input=True,
+        engine='sklearn',
+        random_state=42
+    )
+    
+    mca.fit(df)
+    
+    # Get row coordinates (household positions in latent space)
+    row_coords = mca.row_coordinates(df).values
+    
+    # Get column coordinates (product/category positions)
+    col_coords = mca.column_coordinates(df)
+    
+    # Extract just the "1" (purchased) coordinates for each product
+    # MCA creates two coordinates per binary variable: one for 0 and one for 1
+    # We want the "1" coordinates to understand purchase patterns
+    product_coords = []
+    product_labels = []
+    
+    for prod in product_names:
+        # Look for the "1" category coordinate
+        key_1 = f"{prod}_1"
+        if key_1 in col_coords.index:
+            product_coords.append(col_coords.loc[key_1].values)
+            product_labels.append(prod)
+    
+    product_coords = np.array(product_coords)
+    
+    # Eigenvalues and explained inertia (variance)
+    eigenvalues = mca.eigenvalues_
+    total_inertia = mca.total_inertia_
+    explained_inertia = mca.percentage_of_variance_/100  # Convert to fraction
+    
+    # Percentage of variance explained
+    var_explained_pct = np.array(explained_inertia) * 100
+    
+    # Column contributions (how much each variable contributes to each dimension)
+    # This helps interpret what each dimension means
+    col_contribs = mca.column_contributions_
+    
+    # Extract contributions for "purchased" categories only
+    product_contribs = []
+    for prod in product_names:
+        key_1 = f"{prod}_1"
+        if key_1 in col_contribs.index:
+            product_contribs.append(col_contribs.loc[key_1].values)
+    product_contribs = np.array(product_contribs)
+    
+    # Compute correlation-like matrix from product coordinates
+    # Products close in MCA space have similar purchase patterns
+    if len(product_coords) > 0:
+        # Normalize coordinates
+        norms = np.linalg.norm(product_coords, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-10)
+        coords_normalized = product_coords / norms
+        
+        # Cosine similarity as correlation proxy
+        similarity_matrix = coords_normalized @ coords_normalized.T
+    else:
+        similarity_matrix = np.eye(n_items)
+    
+    return {
+        'row_coordinates': row_coords,  # Household scores
+        'column_coordinates': product_coords,  # Product loadings
+        'product_labels': product_labels,
+        'eigenvalues': eigenvalues,
+        'explained_inertia': explained_inertia,
+        'var_explained_pct': var_explained_pct,
+        'total_inertia': total_inertia,
+        'contributions': product_contribs,  # Product contributions to each dim
+        'similarity_matrix': similarity_matrix,
+        'n_components': n_components,
+        'mca_model': mca
+    }
+
+
+def plot_mca_biplot(row_coords: np.ndarray, col_coords: np.ndarray, 
+                    product_labels: list, dim1: int = 0, dim2: int = 1,
+                    var_explained: list = None) -> go.Figure:
+    """
+    Create MCA biplot showing products and households in latent space.
+    """
+    fig = go.Figure()
+    print(row_coords.shape, col_coords.shape)
+    # Plot households (row coordinates) as small points
+    fig.add_trace(go.Scatter(
+        x=row_coords[:, dim1],
+        y=row_coords[:, dim2],
+        mode='markers',
+        marker=dict(size=4, color='lightblue', opacity=0.5),
+        name='Households',
+        hoverinfo='skip'
+    ))
+    
+    # Plot products (column coordinates) as labeled points
+    fig.add_trace(go.Scatter(
+        x=col_coords[:, dim1],
+        y=col_coords[:, dim2],
+        mode='markers+text',
+        marker=dict(size=12, color='red', symbol='diamond'),
+        text=product_labels,
+        textposition='top center',
+        name='Products',
+        hovertemplate='%{text}<br>Dim %d: %{x:.3f}<br>Dim %d: %{y:.3f}<extra></extra>' % (dim1+1, dim2+1)
+    ))
+    
+    # Add origin lines
+    fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+    fig.add_vline(x=0, line_dash="dash", line_color="gray", opacity=0.5)
+    
+    # Axis labels with variance explained
+    if var_explained is not None:
+        x_label = f"Dimension {dim1+1} ({var_explained[dim1]:.1f}%)"
+        y_label = f"Dimension {dim2+1} ({var_explained[dim2]:.1f}%)"
+    else:
+        x_label = f"Dimension {dim1+1}"
+        y_label = f"Dimension {dim2+1}"
+    
+    fig.update_layout(
+        title='MCA Biplot: Products and Households in Latent Space',
+        xaxis_title=x_label,
+        yaxis_title=y_label,
+        height=600,
+        showlegend=True
+    )
+    
+    return fig
+
+
+def plot_mca_contributions(contributions: np.ndarray, product_labels: list,
+                           n_dims: int = 3) -> go.Figure:
+    """
+    Plot product contributions to each MCA dimension.
+    Higher contribution = product is more important in defining that dimension.
+    """
+    n_dims = min(n_dims, contributions.shape[1])
+    
+    fig = make_subplots(
+        rows=1, cols=n_dims,
+        subplot_titles=[f"Dimension {i+1}" for i in range(n_dims)]
+    )
+    
+    for dim in range(n_dims):
+        # Sort by contribution
+        sorted_idx = np.argsort(contributions[:, dim])[::-1]
+        
+        fig.add_trace(
+            go.Bar(
+                x=[product_labels[i] for i in sorted_idx],
+                y=contributions[sorted_idx, dim] * 100,
+                marker_color='steelblue',
+                showlegend=False
+            ),
+            row=1, col=dim+1
+        )
+    
+    fig.update_layout(
+        title='Product Contributions to MCA Dimensions (%)',
+        height=400
+    )
+    
+    for i in range(n_dims):
+        fig.update_xaxes(tickangle=45, row=1, col=i+1)
+        fig.update_yaxes(title_text="Contribution %" if i == 0 else "", row=1, col=i+1)
+    
+    return fig
 
 
 # =============================================================================
@@ -966,7 +1336,14 @@ def main():
     
     # Check PyMC availability
     if not PYMC_AVAILABLE:
-        st.warning("⚠️ PyMC not installed. PyMC-based models will be unavailable. Install with: `pip install pymc arviz`")
+        if PYMC_ERROR:
+            st.warning(f"⚠️ PyMC initialization issue: {PYMC_ERROR}. PyMC-based models will be unavailable.")
+        else:
+            st.warning("⚠️ PyMC not installed. PyMC-based models will be unavailable. Install with: `pip install pymc arviz`")
+    
+    # Check prince availability
+    if not PRINCE_AVAILABLE:
+        st.info("💡 Install `prince` for Multiple Correspondence Analysis (MCA): `pip install prince`")
     
     # Sidebar
     with st.sidebar:
@@ -1004,6 +1381,9 @@ def main():
             "Non-negative Matrix Factorization (NMF)"
         ]
         
+        if PRINCE_AVAILABLE:
+            model_options.append("Multiple Correspondence Analysis (MCA)")
+        
         if PYMC_AVAILABLE:
             model_options.extend([
                 "Bayesian Factor Model (PyMC)",
@@ -1017,8 +1397,9 @@ def main():
             **LCA**: Discrete latent segments  
             **Tetrachoric FA**: Continuous latent factors (proper for binary)  
             **Bayesian FA (VI)**: Fast variational inference  
-            **Bayesian FA (PyMC)**: Full MCMC with uncertainty  
             **NMF**: Parts-based decomposition  
+            **MCA**: PCA for categorical data - ideal for binary purchase data  
+            **Bayesian FA (PyMC)**: Full MCMC with uncertainty  
             **Discrete Choice (PyMC)**: Model with household/product features
             """
         )
@@ -1149,6 +1530,10 @@ def main():
                 n_components = st.slider("Number of Components", 1, min(10, len(product_columns) - 1), 2)
             with col2:
                 max_iter = st.slider("Max Iterations", 50, 500, 200)
+        
+        elif model_type == "Multiple Correspondence Analysis (MCA)":
+            n_components = st.slider("Number of Dimensions", 2, min(10, len(product_columns) - 1), 3,
+                                    help="Number of latent dimensions to extract")
         
         elif model_type == "Discrete Choice Model (PyMC)":
             col1, col2, col3 = st.columns(3)
@@ -1305,7 +1690,14 @@ def main():
             
             # =========== BAYESIAN FA (PyMC) ===========
             elif model_type == "Bayesian Factor Model (PyMC)":
-                st.header("📊 Bayesian Factor Model (PyMC - Full MCMC)")
+                st.header("📊 Bayesian Factor Model (PyMC - Identified)")
+                
+                st.info("""
+                **Model uses identified parameterization:**
+                - Lower triangular loadings matrix with positive diagonal
+                - This removes rotation invariance and sign ambiguity
+                - Factor k is "anchored" by item k having positive loading
+                """)
                 
                 with st.spinner("Running MCMC sampling (this may take a few minutes)..."):
                     bfa_result = fit_bayesian_factor_model_pymc(X, n_factors, 
@@ -1315,13 +1707,31 @@ def main():
                 st.success("MCMC sampling complete!")
                 
                 # Model diagnostics
-                col1, col2 = st.columns(2)
+                col1, col2, col3 = st.columns(3)
                 with col1:
-                    st.metric("WAIC", f"{bfa_result['waic'].elpd_waic:.2f}")
+                    if bfa_result['waic'] is not None:
+                        st.metric("WAIC", f"{bfa_result['waic'].elpd_waic:.2f}")
+                    else:
+                        st.metric("WAIC", "N/A")
                 with col2:
-                    st.metric("Effective Parameters", f"{bfa_result['waic'].p_waic:.1f}")
+                    if bfa_result['waic'] is not None:
+                        st.metric("Effective Parameters", f"{bfa_result['waic'].p_waic:.1f}")
+                    else:
+                        st.metric("Effective Parameters", "N/A")
+                with col3:
+                    n_div = bfa_result.get('n_divergences', 0)
+                    if n_div > 0:
+                        st.metric("⚠️ Divergences", n_div)
+                    else:
+                        st.metric("✅ Divergences", 0)
+                
+                if bfa_result.get('n_divergences', 0) > 0:
+                    st.warning(f"Model had {bfa_result['n_divergences']} divergent transitions. "
+                              "Results may be unreliable. Consider: fewer factors, more tuning samples, "
+                              "or higher target_accept.")
                 
                 st.subheader("Factor Loadings (Posterior Mean ± SD)")
+                st.caption("Lower triangular structure: Factor k is anchored by item k (diagonal)")
                 fig = plot_loadings_with_uncertainty(bfa_result['loadings'], 
                                                      bfa_result['loadings_std'],
                                                      product_columns)
@@ -1376,9 +1786,104 @@ def main():
                 
                 similarity_matrix = cosine_sim
             
+            # =========== MCA ===========
+            elif model_type == "Multiple Correspondence Analysis (MCA)":
+                st.header("📊 Multiple Correspondence Analysis")
+                
+                st.info("""
+                **MCA is PCA for categorical/binary data.** It's ideal for purchase matrices because:
+                - No normality assumptions required
+                - Handles binary 0/1 data natively
+                - Reveals co-purchase patterns as latent dimensions
+                - Dimensions can be interpreted as shopping "styles" or product affinities
+                """)
+                
+                with st.spinner("Fitting MCA model..."):
+                    mca_result = fit_mca(X, n_components, product_names=product_columns)
+                
+                st.success("MCA complete!")
+                
+                # Variance explained
+                st.subheader("Explained Inertia (Variance)")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Total Inertia", f"{mca_result['total_inertia']:.4f}")
+                with col2:
+                    total_explained = sum(mca_result['var_explained_pct'][:n_components])
+                    st.metric("Total Explained", f"{total_explained:.1f}%")
+                
+                fig = plot_variance_explained(mca_result['var_explained_pct'], "MCA")
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Biplot
+                st.subheader("MCA Biplot")
+                st.caption("Products close together have similar purchase patterns. Households near a product tend to buy it.")
+                
+                if n_components >= 2:
+                    dim_options = list(range(n_components))
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        dim1 = st.selectbox("X-axis dimension", dim_options, index=0)
+                    with col2:
+                        dim2 = st.selectbox("Y-axis dimension", dim_options, index=1 if n_components > 1 else 0)
+                    
+                    fig = plot_mca_biplot(
+                        mca_result['row_coordinates'],
+                        mca_result['column_coordinates'],
+                        mca_result['product_labels'],
+                        dim1=dim1,
+                        dim2=dim2,
+                        var_explained=list(mca_result['var_explained_pct'])
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                # Product contributions
+                st.subheader("Product Contributions to Dimensions")
+                st.caption("Higher contribution = product is more important in defining that dimension")
+                
+                fig = plot_mca_contributions(
+                    mca_result['contributions'],
+                    mca_result['product_labels'],
+                    n_dims=min(3, n_components)
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Product coordinates (loadings equivalent)
+                st.subheader("Product Coordinates (Dimension Loadings)")
+                dim_labels = [f"Dim {k+1}" for k in range(n_components)]
+                loadings_df = pd.DataFrame(
+                    mca_result['column_coordinates'],
+                    index=mca_result['product_labels'],
+                    columns=dim_labels
+                )
+                fig = plot_loadings_heatmap(
+                    mca_result['column_coordinates'],
+                    mca_result['product_labels'],
+                    dim_labels,
+                    "Product Coordinates in MCA Space"
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Product similarity
+                st.subheader("Product Similarity (from MCA)")
+                fig = plot_correlation_matrix(
+                    mca_result['similarity_matrix'],
+                    mca_result['product_labels'],
+                    "Product Similarity (cosine in MCA space)"
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+                similarity_matrix = mca_result['similarity_matrix']
+            
             # =========== DISCRETE CHOICE MODEL (PyMC) ===========
             elif model_type == "Discrete Choice Model (PyMC)":
                 st.header("📊 Discrete Choice Model (PyMC)")
+                
+                st.info("""
+                **Model uses non-centered parameterization** for hierarchical effects to reduce divergences.
+                Features are standardized automatically.
+                """)
                 
                 # Prepare household features
                 hh_features = None
@@ -1408,7 +1913,22 @@ def main():
                 st.success("MCMC sampling complete!")
                 
                 # Model diagnostics
-                st.metric("WAIC", f"{dcm_result['waic'].elpd_waic:.2f}")
+                col1, col2 = st.columns(2)
+                with col1:
+                    if dcm_result.get('waic') is not None:
+                        st.metric("WAIC", f"{dcm_result['waic'].elpd_waic:.2f}")
+                    else:
+                        st.metric("WAIC", "N/A")
+                with col2:
+                    n_div = dcm_result.get('n_divergences', 0)
+                    if n_div > 0:
+                        st.metric("⚠️ Divergences", n_div)
+                    else:
+                        st.metric("✅ Divergences", 0)
+                
+                if dcm_result.get('n_divergences', 0) > 0:
+                    st.warning(f"Model had {dcm_result['n_divergences']} divergent transitions. "
+                              "Consider: more tuning samples, higher target_accept, or simpler model.")
                 
                 # Product intercepts
                 st.subheader("Baseline Purchase Probabilities")
@@ -1501,9 +2021,17 @@ def main():
                 | **LCA** | Discrete customer segments | Class memberships |
                 | **Tetrachoric FA** | Continuous latent factors | Factor loadings |
                 | **Bayesian FA (VI)** | Fast approximation | Point estimates |
-                | **Bayesian FA (PyMC)** | Full uncertainty | Posteriors + credible intervals |
                 | **NMF** | Parts-based decomposition | Non-negative components |
+                | **MCA** | Binary/categorical data (no assumptions) | Dimension coordinates |
+                | **Bayesian FA (PyMC)** | Full uncertainty | Posteriors + credible intervals |
                 | **Discrete Choice (PyMC)** | Understanding drivers | Feature coefficients |
+                
+                ### MCA Interpretation
+                
+                - **Biplot**: Products close together → similar purchase patterns. Households near a product → likely buyers.
+                - **Dimensions**: Each dimension captures a "shopping style" or product affinity pattern.
+                - **Contributions**: Shows which products define each dimension most strongly.
+                - **Inertia**: MCA's analog to variance explained. Total inertia = (n_categories/n_variables) - 1 for binary data.
                 
                 ### Discrete Choice Model Interpretation
                 
@@ -1515,6 +2043,7 @@ def main():
                 ### Substitution Patterns
                 - Products with opposite signs on household features → potential substitutes
                 - Products with same signs → potential complements
+                - Products on opposite sides of MCA origin → different customer bases
                 """)
             
             # =========== DOWNLOADS ===========
@@ -1559,6 +2088,16 @@ def main():
                                                columns=[f'Component_{k+1}' for k in range(n_components)])
                     csv = loadings_df.to_csv()
                     st.download_button("Download NMF Loadings", csv, "nmf_loadings.csv", "text/csv")
+                
+                elif model_type == "Multiple Correspondence Analysis (MCA)":
+                    # Download product coordinates
+                    coords_df = pd.DataFrame(
+                        mca_result['column_coordinates'],
+                        index=mca_result['product_labels'],
+                        columns=[f'Dim_{k+1}' for k in range(n_components)]
+                    )
+                    csv = coords_df.to_csv()
+                    st.download_button("Download MCA Coordinates", csv, "mca_coordinates.csv", "text/csv")
                 
                 elif model_type == "Discrete Choice Model (PyMC)":
                     # Download coefficient summary

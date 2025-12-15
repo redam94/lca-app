@@ -13,6 +13,7 @@ dependencies = [
     "nutpie>=0.16.4",
     "pandas>=2.0.0",
     "plotly>=5.18.0",
+    "prince>=0.16.2",
     "pymc>=5.26.1",
     "scipy>=1.11.0",
     "streamlit>=1.28.0",
