@@ -36,7 +36,6 @@ PYMC_AVAILABLE = False
 PYMC_ERROR = None
 try:
     import pytensor
-    
     import pymc as pm
     import arviz as az
     PYMC_AVAILABLE = True
@@ -887,9 +886,10 @@ def fit_mca(data: np.ndarray, n_components: int, product_names: list = None) -> 
     
     # Get row coordinates (household positions in latent space)
     row_coords = mca.row_coordinates(df).values
-    
+    print("row_coords.shape:", row_coords.shape)
     # Get column coordinates (product/category positions)
     col_coords = mca.column_coordinates(df)
+    print("col_coords.shape:", col_coords.shape)
     
     # Extract just the "1" (purchased) coordinates for each product
     # MCA creates two coordinates per binary variable: one for 0 and one for 1
@@ -899,17 +899,17 @@ def fit_mca(data: np.ndarray, n_components: int, product_names: list = None) -> 
     
     for prod in product_names:
         # Look for the "1" category coordinate
-        key_1 = f"{prod}_1"
+        key_1 = f"{prod}__1"
         if key_1 in col_coords.index:
             product_coords.append(col_coords.loc[key_1].values)
             product_labels.append(prod)
     
     product_coords = np.array(product_coords)
-    
+    print("product_coords.shape:", product_coords.shape)
     # Eigenvalues and explained inertia (variance)
     eigenvalues = mca.eigenvalues_
     total_inertia = mca.total_inertia_
-    explained_inertia = mca.percentage_of_variance_/100  # Convert to fraction
+    explained_inertia = mca.percentage_of_variance_/100
     
     # Percentage of variance explained
     var_explained_pct = np.array(explained_inertia) * 100
@@ -921,7 +921,7 @@ def fit_mca(data: np.ndarray, n_components: int, product_names: list = None) -> 
     # Extract contributions for "purchased" categories only
     product_contribs = []
     for prod in product_names:
-        key_1 = f"{prod}_1"
+        key_1 = f"{prod}__1"
         if key_1 in col_contribs.index:
             product_contribs.append(col_contribs.loc[key_1].values)
     product_contribs = np.array(product_contribs)
@@ -962,7 +962,7 @@ def plot_mca_biplot(row_coords: np.ndarray, col_coords: np.ndarray,
     """
     fig = go.Figure()
     print(row_coords.shape, col_coords.shape)
-    # Plot households (row coordinates) as small points
+    #Plot households (row coordinates) as small points
     fig.add_trace(go.Scatter(
         x=row_coords[:, dim1],
         y=row_coords[:, dim2],
@@ -981,7 +981,7 @@ def plot_mca_biplot(row_coords: np.ndarray, col_coords: np.ndarray,
         text=product_labels,
         textposition='top center',
         name='Products',
-        hovertemplate='%{text}<br>Dim %d: %{x:.3f}<br>Dim %d: %{y:.3f}<extra></extra>' % (dim1+1, dim2+1)
+        hovertemplate='{text}<br>Dim %d: {x:.3f}<br>Dim %d: {y:.3f}<extra></extra>' % (dim1+1, dim2+1)
     ))
     
     # Add origin lines
@@ -1013,7 +1013,7 @@ def plot_mca_contributions(contributions: np.ndarray, product_labels: list,
     Plot product contributions to each MCA dimension.
     Higher contribution = product is more important in defining that dimension.
     """
-    n_dims = min(n_dims, contributions.shape[1])
+    n_dims = min(n_dims, contributions.shape[0])
     
     fig = make_subplots(
         rows=1, cols=n_dims,
