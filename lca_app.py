@@ -10,8 +10,10 @@ import numpy as np
 from scipy.special import logsumexp
 from scipy.stats import norm
 from scipy.optimize import minimize_scalar
-from scipy.cluster.hierarchy import linkage, dendrogram
+from scipy.cluster.hierarchy import linkage, dendrogram, fcluster
 from scipy.spatial.distance import squareform
+from sklearn.cluster import KMeans, DBSCAN
+from sklearn.metrics import silhouette_score
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -377,9 +379,10 @@ def fit_bayesian_factor_model_pymc(data: np.ndarray, n_factors: int, n_samples: 
         prob = pm.math.sigmoid(pm.math.dot(scores, loadings.T))
         likelihood = pm.Bernoulli('obs', p=prob, observed=data)
         
-        trace = pm.sample(n_samples, tune=n_tune, cores=1, 
+        trace = pm.sample(n_samples, tune=n_tune,
                          return_inferencedata=True, progressbar=True,
-                         target_accept=0.9)
+                         target_accept=0.9, nuts_sampler='nutpie')
+        trace = pm.compute_log_likelihood(trace)
     
     loadings_samples = trace.posterior['loadings'].values.reshape(-1, n_items, n_factors)
     loadings_mean = loadings_samples.mean(axis=0)
@@ -455,9 +458,10 @@ def fit_discrete_choice_model_pymc(data: np.ndarray, household_features: np.ndar
         prob = pm.math.sigmoid(utility)
         likelihood = pm.Bernoulli('obs', p=prob, observed=data)
         
-        trace = pm.sample(n_samples, tune=n_tune, cores=1,
+        trace = pm.sample(n_samples, tune=n_tune, nuts_sampler='nutpie',
                          return_inferencedata=True, progressbar=True,
                          target_accept=0.95)
+        trace = pm.compute_log_likelihood(trace)
     
     alpha_samples = trace.posterior['alpha'].values.reshape(-1, n_items)
     alpha_mean = alpha_samples.mean(axis=0)
@@ -763,6 +767,271 @@ def plot_mca_contributions(contributions: np.ndarray, product_labels: list,
 
 
 # =============================================================================
+# GENERIC BIPLOT FUNCTION FOR ALL MODELS
+# =============================================================================
+
+def plot_generic_biplot(row_coords: np.ndarray, col_coords: np.ndarray, 
+                        product_labels: list, dim1: int = 0, dim2: int = 1,
+                        var_explained: list = None, model_name: str = "Model",
+                        cluster_labels: np.ndarray = None,
+                        show_households: bool = True) -> go.Figure:
+    """
+    Create a generic biplot showing products and optionally households in latent space.
+    
+    Args:
+        row_coords: Household/observation coordinates (n_obs x n_dims)
+        col_coords: Product/variable coordinates (n_items x n_dims)
+        product_labels: Names of products
+        dim1, dim2: Which dimensions to plot
+        var_explained: Variance explained by each dimension (for axis labels)
+        model_name: Name of the model for the title
+        cluster_labels: Optional cluster assignments for products
+        show_households: Whether to show household points
+    """
+    fig = go.Figure()
+    
+    # Plot households (row coordinates) as small points
+    if show_households and row_coords is not None and len(row_coords) > 0:
+        fig.add_trace(go.Scatter(
+            x=row_coords[:, dim1],
+            y=row_coords[:, dim2],
+            mode='markers',
+            marker=dict(size=4, color='lightblue', opacity=0.5),
+            name='Households',
+            hoverinfo='skip'
+        ))
+    
+    # Plot products (column coordinates) as labeled points
+    if cluster_labels is not None:
+        # Color by cluster
+        unique_clusters = np.unique(cluster_labels)
+        colors = px.colors.qualitative.Set1[:len(unique_clusters)]
+        
+        for i, cluster in enumerate(unique_clusters):
+            mask = cluster_labels == cluster
+            cluster_name = f"Cluster {cluster + 1}" if cluster >= 0 else "Noise"
+            fig.add_trace(go.Scatter(
+                x=col_coords[mask, dim1],
+                y=col_coords[mask, dim2],
+                mode='markers+text',
+                marker=dict(size=14, color=colors[i % len(colors)], symbol='diamond',
+                           line=dict(width=1, color='black')),
+                text=[product_labels[j] for j in np.where(mask)[0]],
+                textposition='top center',
+                name=cluster_name,
+                hovertemplate='{text}<br>Dim %d: {x:.3f}<br>Dim %d: {y:.3f}<extra></extra>' % (dim1+1, dim2+1)
+            ))
+    else:
+        fig.add_trace(go.Scatter(
+            x=col_coords[:, dim1],
+            y=col_coords[:, dim2],
+            mode='markers+text',
+            marker=dict(size=12, color='red', symbol='diamond'),
+            text=product_labels,
+            textposition='top center',
+            name='Products',
+            hovertemplate='{text}<br>Dim %d: {x:.3f}<br>Dim %d: {y:.3f}<extra></extra>' % (dim1+1, dim2+1)
+        ))
+    
+    # Add origin lines
+    fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+    fig.add_vline(x=0, line_dash="dash", line_color="gray", opacity=0.5)
+    
+    # Axis labels with variance explained
+    if var_explained is not None and len(var_explained) > max(dim1, dim2):
+        x_label = f"Dimension {dim1+1} ({var_explained[dim1]:.1f}%)"
+        y_label = f"Dimension {dim2+1} ({var_explained[dim2]:.1f}%)"
+    else:
+        x_label = f"Dimension {dim1+1}"
+        y_label = f"Dimension {dim2+1}"
+    
+    fig.update_layout(
+        title=f'{model_name} Biplot: Products in Latent Space',
+        xaxis_title=x_label,
+        yaxis_title=y_label,
+        height=600,
+        showlegend=True
+    )
+    
+    return fig
+
+
+# =============================================================================
+# CLUSTERING FUNCTIONS FOR EMBEDDING SPACE
+# =============================================================================
+
+def cluster_products_kmeans(embeddings: np.ndarray, n_clusters: int) -> dict:
+    """Cluster products using K-means in the embedding space."""
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    labels = kmeans.fit_predict(embeddings)
+    
+    # Compute silhouette score if we have more than 1 cluster
+    sil_score = None
+    if n_clusters > 1 and n_clusters < len(embeddings):
+        try:
+            sil_score = silhouette_score(embeddings, labels)
+        except:
+            pass
+    
+    return {
+        'labels': labels,
+        'centers': kmeans.cluster_centers_,
+        'inertia': kmeans.inertia_,
+        'silhouette': sil_score,
+        'n_clusters': n_clusters
+    }
+
+
+def find_optimal_clusters(embeddings: np.ndarray, max_clusters: int = 10) -> dict:
+    """Find optimal number of clusters using silhouette score."""
+    max_clusters = min(max_clusters, len(embeddings) - 1)
+    if max_clusters < 2:
+        return {'optimal_k': 1, 'scores': [], 'range': []}
+    
+    scores = []
+    k_range = range(2, max_clusters + 1)
+    
+    for k in k_range:
+        try:
+            kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+            labels = kmeans.fit_predict(embeddings)
+            score = silhouette_score(embeddings, labels)
+            scores.append(score)
+        except:
+            scores.append(0)
+    
+    if len(scores) > 0:
+        optimal_k = list(k_range)[np.argmax(scores)]
+    else:
+        optimal_k = 2
+    
+    return {
+        'optimal_k': optimal_k,
+        'scores': scores,
+        'range': list(k_range)
+    }
+
+
+def cluster_products_hierarchical(embeddings: np.ndarray, n_clusters: int, 
+                                   method: str = 'ward') -> dict:
+    """Cluster products using hierarchical clustering."""
+    Z = linkage(embeddings, method=method)
+    labels = fcluster(Z, n_clusters, criterion='maxclust') - 1  # 0-indexed
+    
+    # Compute silhouette score
+    sil_score = None
+    if n_clusters > 1 and n_clusters < len(embeddings):
+        try:
+            sil_score = silhouette_score(embeddings, labels)
+        except:
+            pass
+    
+    return {
+        'labels': labels,
+        'linkage_matrix': Z,
+        'silhouette': sil_score,
+        'n_clusters': n_clusters
+    }
+
+
+def plot_cluster_summary(embeddings: np.ndarray, labels: np.ndarray, 
+                         product_labels: list, title: str = "Cluster Summary") -> go.Figure:
+    """Create a summary visualization of clusters."""
+    unique_clusters = np.unique(labels)
+    n_clusters = len(unique_clusters)
+    
+    # Create subplots: cluster sizes + cluster profiles
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=["Cluster Sizes", "Cluster Centers (Mean Coordinates)"],
+        column_widths=[0.3, 0.7]
+    )
+    
+    # Cluster sizes
+    cluster_sizes = [np.sum(labels == c) for c in unique_clusters]
+    cluster_names = [f"Cluster {c+1}" for c in unique_clusters]
+    
+    fig.add_trace(
+        go.Bar(x=cluster_names, y=cluster_sizes, marker_color='steelblue', showlegend=False),
+        row=1, col=1
+    )
+    
+    # Cluster centers (mean coordinates for first few dimensions)
+    n_dims_to_show = min(5, embeddings.shape[1])
+    centers = np.array([embeddings[labels == c].mean(axis=0)[:n_dims_to_show] for c in unique_clusters])
+    
+    for i, cluster in enumerate(unique_clusters):
+        fig.add_trace(
+            go.Bar(
+                name=f"Cluster {cluster+1}",
+                x=[f"Dim {d+1}" for d in range(n_dims_to_show)],
+                y=centers[i],
+                showlegend=True
+            ),
+            row=1, col=2
+        )
+    
+    fig.update_layout(
+        title=title,
+        height=400,
+        barmode='group'
+    )
+    
+    return fig
+
+
+def get_cluster_members(labels: np.ndarray, product_labels: list) -> pd.DataFrame:
+    """Create a DataFrame showing cluster membership."""
+    df = pd.DataFrame({
+        'Product': product_labels,
+        'Cluster': labels + 1  # 1-indexed for display
+    })
+    return df.sort_values('Cluster')
+
+
+# =============================================================================
+# FACTOR SCORE COMPUTATION
+# =============================================================================
+
+def compute_factor_scores_regression(data: np.ndarray, loadings: np.ndarray) -> np.ndarray:
+    """
+    Compute factor scores using regression method.
+    scores = data @ loadings @ inv(loadings.T @ loadings)
+    """
+    # Center the data
+    data_centered = data - data.mean(axis=0)
+    
+    # Regression method: (L'L)^-1 L' X'
+    LtL = loadings.T @ loadings
+    try:
+        LtL_inv = np.linalg.inv(LtL + np.eye(LtL.shape[0]) * 1e-6)  # Regularization
+        scores = data_centered @ loadings @ LtL_inv
+    except:
+        # Fallback: simple projection
+        scores = data_centered @ loadings
+    
+    return scores
+
+
+def compute_lca_coordinates(class_probs: np.ndarray, item_probs: np.ndarray, 
+                            responsibilities: np.ndarray) -> tuple:
+    """
+    Compute coordinates for LCA visualization.
+    Products: use item_probs across classes
+    Households: use responsibilities (posterior class probabilities)
+    """
+    # For products: transpose item_probs so each product has coordinates across classes
+    # item_probs shape: (n_classes, n_items) -> product_coords: (n_items, n_classes)
+    product_coords = item_probs.T
+    
+    # For households: use responsibilities directly
+    # responsibilities shape: (n_obs, n_classes)
+    household_coords = responsibilities
+    
+    return household_coords, product_coords
+
+
+# =============================================================================
 # HIERARCHICAL CLUSTERING
 # =============================================================================
 
@@ -1036,12 +1305,13 @@ def compute_residual_correlations(data: np.ndarray, responsibilities: np.ndarray
 
 
 # =============================================================================
-# HELPER FUNCTION: Generate cache key for MCA results
+# HELPER FUNCTION: Generate cache key for model results
 # =============================================================================
 
-def get_mca_cache_key(data_hash: str, n_components: int, product_columns: tuple) -> str:
-    """Generate a unique cache key for MCA results based on input parameters."""
-    return f"mca_{data_hash}_{n_components}_{hash(product_columns)}"
+def get_model_cache_key(data_hash: str, model_type: str, model_params: dict, product_columns: tuple) -> str:
+    """Generate a unique cache key for model results based on input parameters."""
+    params_hash = hash(frozenset(model_params.items()))
+    return f"{model_type}_{data_hash}_{params_hash}_{hash(product_columns)}"
 
 
 # =============================================================================
@@ -1056,15 +1326,25 @@ def main():
     Discover latent customer segments and product relationships using multiple statistical methods.
     """)
     
-    # Initialize session state for MCA results
-    if 'mca_result' not in st.session_state:
-        st.session_state.mca_result = None
-    if 'mca_cache_key' not in st.session_state:
-        st.session_state.mca_cache_key = None
-    if 'mca_product_columns' not in st.session_state:
-        st.session_state.mca_product_columns = None
-    if 'mca_similarity_matrix' not in st.session_state:
-        st.session_state.mca_similarity_matrix = None
+    # Initialize session state for model results (prevents rerun on UI changes)
+    if 'model_result' not in st.session_state:
+        st.session_state.model_result = None
+    if 'model_cache_key' not in st.session_state:
+        st.session_state.model_cache_key = None
+    if 'model_type_cached' not in st.session_state:
+        st.session_state.model_type_cached = None
+    if 'product_columns_cached' not in st.session_state:
+        st.session_state.product_columns_cached = None
+    if 'similarity_matrix_cached' not in st.session_state:
+        st.session_state.similarity_matrix_cached = None
+    if 'product_embeddings' not in st.session_state:
+        st.session_state.product_embeddings = None
+    if 'household_embeddings' not in st.session_state:
+        st.session_state.household_embeddings = None
+    if 'var_explained_cached' not in st.session_state:
+        st.session_state.var_explained_cached = None
+    if 'cluster_result' not in st.session_state:
+        st.session_state.cluster_result = None
     
     # Check PyMC availability
     if not PYMC_AVAILABLE:
@@ -1263,15 +1543,34 @@ def main():
                 options=['average', 'complete', 'single']
             )
         
-        # For MCA: Check if we need to invalidate the cache
-        if model_type == "Multiple Correspondence Analysis (MCA)":
-            current_cache_key = get_mca_cache_key(data_hash, n_components, tuple(product_columns))
-            if st.session_state.mca_cache_key != current_cache_key:
-                # Parameters changed, invalidate cache
-                st.session_state.mca_result = None
-                st.session_state.mca_cache_key = None
-                st.session_state.mca_product_columns = None
-                st.session_state.mca_similarity_matrix = None
+        # Build model parameters dict for cache key
+        model_params = {}
+        if model_type == "Latent Class Analysis (LCA)":
+            model_params = {'n_classes': n_classes, 'max_iter': max_iter, 'n_init': n_init}
+        elif model_type in ["Factor Analysis (Tetrachoric)", "Bayesian Factor Model (VI)"]:
+            model_params = {'n_factors': n_factors, 'max_iter': max_iter}
+        elif model_type == "Bayesian Factor Model (PyMC)":
+            model_params = {'n_factors': n_factors, 'n_samples': n_samples, 'n_tune': n_tune}
+        elif model_type == "Non-negative Matrix Factorization (NMF)":
+            model_params = {'n_components': n_components, 'max_iter': max_iter}
+        elif model_type == "Multiple Correspondence Analysis (MCA)":
+            model_params = {'n_components': n_components}
+        elif model_type == "Discrete Choice Model (PyMC)":
+            model_params = {'n_samples': n_samples, 'n_tune': n_tune, 'random_effects': include_random_effects}
+        
+        # Check if we need to invalidate the cache
+        current_cache_key = get_model_cache_key(data_hash, model_type, model_params, tuple(product_columns))
+        if st.session_state.model_cache_key != current_cache_key:
+            # Parameters changed, invalidate cache
+            st.session_state.model_result = None
+            st.session_state.model_cache_key = None
+            st.session_state.model_type_cached = None
+            st.session_state.product_columns_cached = None
+            st.session_state.similarity_matrix_cached = None
+            st.session_state.product_embeddings = None
+            st.session_state.household_embeddings = None
+            st.session_state.var_explained_cached = None
+            st.session_state.cluster_result = None
         
         # Run Analysis
         if st.button("🚀 Run Analysis", type="primary"):
@@ -1317,6 +1616,25 @@ def main():
                 with st.spinner("Fitting LCA model..."):
                     result = fit_lca(X, n_classes, max_iter=max_iter, n_init=n_init)
                 
+                # Compute embeddings for biplot
+                household_coords, product_coords = compute_lca_coordinates(
+                    result['class_probs'], result['item_probs'], result['responsibilities']
+                )
+                
+                # Compute similarity matrix
+                residual_corr = compute_residual_correlations(X, result['responsibilities'], result['item_probs'])
+                
+                # Store in session state
+                st.session_state.model_result = result
+                st.session_state.model_cache_key = current_cache_key
+                st.session_state.model_type_cached = model_type
+                st.session_state.product_columns_cached = product_columns
+                st.session_state.similarity_matrix_cached = residual_corr
+                st.session_state.product_embeddings = product_coords
+                st.session_state.household_embeddings = household_coords
+                st.session_state.var_explained_cached = None  # LCA doesn't have variance explained
+                st.session_state.cluster_result = None
+                
                 st.success(f"Model converged in {result['n_iter']} iterations")
                 
                 col1, col2, col3 = st.columns(3)
@@ -1330,14 +1648,6 @@ def main():
                 st.subheader("Class Profiles")
                 fig = plot_lca_profiles(result['item_probs'], product_columns, result['class_probs'])
                 st.plotly_chart(fig, use_container_width=True)
-                
-                st.subheader("Residual Correlations (Substitution Patterns)")
-                residual_corr = compute_residual_correlations(X, result['responsibilities'], result['item_probs'])
-                fig = plot_correlation_matrix(residual_corr, product_columns, 
-                    "Residual Correlations (negative = substitution)")
-                st.plotly_chart(fig, use_container_width=True)
-                
-                similarity_matrix = residual_corr
             
             # =========== TETRACHORIC FA ===========
             elif model_type == "Factor Analysis (Tetrachoric)":
@@ -1359,6 +1669,21 @@ def main():
                 with st.spinner("Fitting factor analysis..."):
                     fa_result = factor_analysis_principal_axis(tetra_corr, n_factors, max_iter=max_iter)
                 
+                # Compute factor scores for biplot
+                factor_scores = compute_factor_scores_regression(X, fa_result['loadings'])
+                
+                # Store in session state
+                st.session_state.model_result = fa_result
+                st.session_state.model_result['tetra_corr'] = tetra_corr
+                st.session_state.model_cache_key = current_cache_key
+                st.session_state.model_type_cached = model_type
+                st.session_state.product_columns_cached = product_columns
+                st.session_state.similarity_matrix_cached = tetra_corr
+                st.session_state.product_embeddings = fa_result['loadings']
+                st.session_state.household_embeddings = factor_scores
+                st.session_state.var_explained_cached = fa_result['var_explained_pct']
+                st.session_state.cluster_result = None
+                
                 st.success(f"Factor analysis converged in {fa_result['n_iter']} iterations")
                 
                 st.subheader("Factor Loadings (Varimax Rotated)")
@@ -1374,8 +1699,6 @@ def main():
                     'Communality': fa_result['communalities']
                 }).sort_values('Communality', ascending=False)
                 st.dataframe(comm_df, use_container_width=True)
-                
-                similarity_matrix = tetra_corr
             
             # =========== BAYESIAN FA (VI) ===========
             elif model_type == "Bayesian Factor Model (VI)":
@@ -1383,6 +1706,21 @@ def main():
                 
                 with st.spinner("Fitting Bayesian factor model..."):
                     bfa_result = fit_bayesian_factor_model_vi(X, n_factors, max_iter=max_iter)
+                
+                # Compute implied correlations
+                loadings_norm = bfa_result['loadings'] / (np.linalg.norm(bfa_result['loadings'], axis=0, keepdims=True) + 1e-10)
+                implied_corr = loadings_norm @ loadings_norm.T
+                
+                # Store in session state
+                st.session_state.model_result = bfa_result
+                st.session_state.model_cache_key = current_cache_key
+                st.session_state.model_type_cached = model_type
+                st.session_state.product_columns_cached = product_columns
+                st.session_state.similarity_matrix_cached = implied_corr
+                st.session_state.product_embeddings = bfa_result['loadings']
+                st.session_state.household_embeddings = bfa_result['scores']
+                st.session_state.var_explained_cached = bfa_result['var_explained_pct']
+                st.session_state.cluster_result = None
                 
                 st.success(f"Model converged in {bfa_result['n_iter']} iterations")
                 
@@ -1399,15 +1737,6 @@ def main():
                 
                 fig = plot_variance_explained(bfa_result['var_explained_pct'], "Bayesian FA (VI)")
                 st.plotly_chart(fig, use_container_width=True)
-                
-                loadings_norm = bfa_result['loadings'] / (np.linalg.norm(bfa_result['loadings'], axis=0, keepdims=True) + 1e-10)
-                implied_corr = loadings_norm @ loadings_norm.T
-                
-                st.subheader("Implied Product Correlations")
-                fig = plot_correlation_matrix(implied_corr, product_columns, "Implied Correlations from Factor Model")
-                st.plotly_chart(fig, use_container_width=True)
-                
-                similarity_matrix = implied_corr
             
             # =========== BAYESIAN FA (PyMC) ===========
             elif model_type == "Bayesian Factor Model (PyMC)":
@@ -1415,6 +1744,24 @@ def main():
                 
                 with st.spinner("Running MCMC sampling... This may take a few minutes."):
                     bfa_result = fit_bayesian_factor_model_pymc(X, n_factors, n_samples=n_samples, n_tune=n_tune)
+                
+                # Compute implied correlations
+                loadings_norm = bfa_result['loadings'] / (np.linalg.norm(bfa_result['loadings'], axis=0, keepdims=True) + 1e-10)
+                implied_corr = loadings_norm @ loadings_norm.T
+                
+                # Compute factor scores for biplot
+                factor_scores = compute_factor_scores_regression(X, bfa_result['loadings'])
+                
+                # Store in session state
+                st.session_state.model_result = bfa_result
+                st.session_state.model_cache_key = current_cache_key
+                st.session_state.model_type_cached = model_type
+                st.session_state.product_columns_cached = product_columns
+                st.session_state.similarity_matrix_cached = implied_corr
+                st.session_state.product_embeddings = bfa_result['loadings']
+                st.session_state.household_embeddings = factor_scores
+                st.session_state.var_explained_cached = bfa_result['var_explained_pct']
+                st.session_state.cluster_result = None
                 
                 st.success("MCMC sampling complete!")
                 
@@ -1437,15 +1784,6 @@ def main():
                 
                 fig = plot_variance_explained(bfa_result['var_explained_pct'], "Bayesian FA (PyMC)")
                 st.plotly_chart(fig, use_container_width=True)
-                
-                loadings_norm = bfa_result['loadings'] / (np.linalg.norm(bfa_result['loadings'], axis=0, keepdims=True) + 1e-10)
-                implied_corr = loadings_norm @ loadings_norm.T
-                
-                st.subheader("Implied Product Correlations")
-                fig = plot_correlation_matrix(implied_corr, product_columns, "Implied Correlations from Bayesian FA")
-                st.plotly_chart(fig, use_container_width=True)
-                
-                similarity_matrix = implied_corr
             
             # =========== NMF ===========
             elif model_type == "Non-negative Matrix Factorization (NMF)":
@@ -1453,6 +1791,21 @@ def main():
                 
                 with st.spinner("Fitting NMF model..."):
                     nmf_result = fit_nmf(X, n_components, max_iter=max_iter)
+                
+                # Compute similarity
+                loadings_norm = nmf_result['loadings'] / (np.linalg.norm(nmf_result['loadings'], axis=1, keepdims=True) + 1e-10)
+                cosine_sim = loadings_norm @ loadings_norm.T
+                
+                # Store in session state
+                st.session_state.model_result = nmf_result
+                st.session_state.model_cache_key = current_cache_key
+                st.session_state.model_type_cached = model_type
+                st.session_state.product_columns_cached = product_columns
+                st.session_state.similarity_matrix_cached = cosine_sim
+                st.session_state.product_embeddings = nmf_result['loadings']
+                st.session_state.household_embeddings = nmf_result['scores']
+                st.session_state.var_explained_cached = nmf_result['var_explained_pct']
+                st.session_state.cluster_result = None
                 
                 st.success(f"NMF converged in {nmf_result['n_iter']} iterations")
                 
@@ -1471,15 +1824,6 @@ def main():
                 
                 fig = plot_variance_explained(nmf_result['var_explained_pct'], "NMF")
                 st.plotly_chart(fig, use_container_width=True)
-                
-                loadings_norm = nmf_result['loadings'] / (np.linalg.norm(nmf_result['loadings'], axis=1, keepdims=True) + 1e-10)
-                cosine_sim = loadings_norm @ loadings_norm.T
-                
-                st.subheader("Product Similarity (from NMF)")
-                fig = plot_correlation_matrix(cosine_sim, product_columns, "Cosine Similarity (NMF)")
-                st.plotly_chart(fig, use_container_width=True)
-                
-                similarity_matrix = cosine_sim
             
             # =========== MCA ===========
             elif model_type == "Multiple Correspondence Analysis (MCA)":
@@ -1497,14 +1841,17 @@ def main():
                     mca_result = fit_mca(X, n_components, product_names=product_columns)
                 
                 # Store results in session state
-                st.session_state.mca_result = mca_result
-                st.session_state.mca_cache_key = get_mca_cache_key(data_hash, n_components, tuple(product_columns))
-                st.session_state.mca_product_columns = product_columns
-                st.session_state.mca_similarity_matrix = mca_result['similarity_matrix']
+                st.session_state.model_result = mca_result
+                st.session_state.model_cache_key = current_cache_key
+                st.session_state.model_type_cached = model_type
+                st.session_state.product_columns_cached = product_columns
+                st.session_state.similarity_matrix_cached = mca_result['similarity_matrix']
+                st.session_state.product_embeddings = mca_result['column_coordinates']
+                st.session_state.household_embeddings = mca_result['row_coordinates']
+                st.session_state.var_explained_cached = mca_result['var_explained_pct']
+                st.session_state.cluster_result = None
                 
                 st.success("MCA complete!")
-                
-                similarity_matrix = mca_result['similarity_matrix']
             
             # =========== DISCRETE CHOICE MODEL (PyMC) ===========
             elif model_type == "Discrete Choice Model (PyMC)":
@@ -1539,6 +1886,26 @@ def main():
                         n_samples=n_samples,
                         n_tune=n_tune
                     )
+                
+                # For DCM, we use alpha (intercepts) and beta (if available) as embeddings
+                # Create product embeddings from coefficients
+                product_embeds = dcm_result['alpha'].reshape(-1, 1)
+                if 'beta' in dcm_result:
+                    product_embeds = np.hstack([product_embeds, dcm_result['beta']])
+                
+                # Compute similarity from raw data correlation
+                similarity_matrix = np.corrcoef(X.T)
+                
+                # Store in session state
+                st.session_state.model_result = dcm_result
+                st.session_state.model_cache_key = current_cache_key
+                st.session_state.model_type_cached = model_type
+                st.session_state.product_columns_cached = product_columns
+                st.session_state.similarity_matrix_cached = similarity_matrix
+                st.session_state.product_embeddings = product_embeds
+                st.session_state.household_embeddings = None  # DCM doesn't have household embeddings
+                st.session_state.var_explained_cached = None
+                st.session_state.cluster_result = None
                 
                 st.success("MCMC sampling complete!")
                 
@@ -1601,115 +1968,255 @@ def main():
                 if include_random_effects and 'sigma_hh' in dcm_result:
                     st.subheader("Household Heterogeneity")
                     st.metric("Household Random Effect SD", f"{dcm_result['sigma_hh']:.3f}")
-                
-                # Compute implied correlations from the model
-                # Use product intercepts to compute similarity
-                alpha = dcm_result['alpha']
-                probs = 1 / (1 + np.exp(-alpha))
-                
-                # Correlation based on predicted probabilities across products
-                # This is a simple approximation
-                similarity_matrix = np.corrcoef(X.T)
-            
-            # =========== HIERARCHICAL CLUSTERING (for non-MCA models) ===========
-            if model_type != "Multiple Correspondence Analysis (MCA)":
-                if show_hierarchy and similarity_matrix is not None:
-                    st.subheader("🌳 Hierarchical Product Relationships")
-                    hc_result = compute_hierarchical_clustering(similarity_matrix, method=linkage_method)
-                    fig = plot_dendrogram(hc_result['linkage_matrix'], product_columns,
-                                          f"Product Hierarchy ({model_type})")
-                    st.plotly_chart(fig, use_container_width=True)
-                    
-                    st.markdown("""
-                    **Reading the Dendrogram:**
-                    - Products that merge at **lower heights** are more similar
-                    - Clusters that form early suggest strong relationships
-                    - Large jumps in height indicate natural groupings
-                    """)
         
-        # =========== MCA RESULTS DISPLAY (outside button block for state persistence) ===========
-        if model_type == "Multiple Correspondence Analysis (MCA)" and st.session_state.mca_result is not None:
-            mca_result = st.session_state.mca_result
-            product_columns_cached = st.session_state.mca_product_columns
+        # =========== UNIFIED VISUALIZATION SECTION (outside button block) ===========
+        # This section displays results from session state, allowing UI changes without model rerun
+        if st.session_state.model_result is not None and st.session_state.model_type_cached == model_type:
+            model_result = st.session_state.model_result
+            product_columns_cached = st.session_state.product_columns_cached
+            product_embeddings = st.session_state.product_embeddings
+            household_embeddings = st.session_state.household_embeddings
+            var_explained = st.session_state.var_explained_cached
+            similarity_matrix = st.session_state.similarity_matrix_cached
             
-            # Variance explained
-            st.subheader("Explained Inertia (Variance)")
+            st.markdown("---")
             
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("Total Inertia", f"{mca_result['total_inertia']:.4f}")
-            with col2:
-                total_explained = sum(mca_result['var_explained_pct'][:mca_result['n_components']])
-                st.metric("Total Explained", f"{total_explained:.1f}%")
+            # =========== MODEL-SPECIFIC ADDITIONAL OUTPUTS ===========
+            if model_type == "Latent Class Analysis (LCA)":
+                st.subheader("Residual Correlations (Substitution Patterns)")
+                fig = plot_correlation_matrix(similarity_matrix, product_columns_cached, 
+                    "Residual Correlations (negative = substitution)")
+                st.plotly_chart(fig, use_container_width=True)
             
-            fig = plot_variance_explained(mca_result['var_explained_pct'], "MCA")
-            st.plotly_chart(fig, use_container_width=True)
+            elif model_type == "Bayesian Factor Model (VI)":
+                st.subheader("Implied Product Correlations")
+                fig = plot_correlation_matrix(similarity_matrix, product_columns_cached, 
+                    "Implied Correlations from Factor Model")
+                st.plotly_chart(fig, use_container_width=True)
             
-            # Biplot with dimension selectors (these won't trigger model rerun)
-            st.subheader("MCA Biplot")
-            st.caption("Products close together have similar purchase patterns. Households near a product tend to buy it.")
+            elif model_type == "Bayesian Factor Model (PyMC)":
+                st.subheader("Implied Product Correlations")
+                fig = plot_correlation_matrix(similarity_matrix, product_columns_cached, 
+                    "Implied Correlations from Bayesian FA")
+                st.plotly_chart(fig, use_container_width=True)
             
-            n_components_result = mca_result['n_components']
-            if n_components_result >= 2:
-                dim_options = list(range(n_components_result))
+            elif model_type == "Non-negative Matrix Factorization (NMF)":
+                st.subheader("Product Similarity (from NMF)")
+                fig = plot_correlation_matrix(similarity_matrix, product_columns_cached, 
+                    "Cosine Similarity (NMF)")
+                st.plotly_chart(fig, use_container_width=True)
+            
+            elif model_type == "Multiple Correspondence Analysis (MCA)":
+                # Variance explained
+                st.subheader("Explained Inertia (Variance)")
+                
                 col1, col2 = st.columns(2)
                 with col1:
-                    dim1 = st.selectbox("X-axis dimension", dim_options, index=0, key="mca_dim1")
+                    st.metric("Total Inertia", f"{model_result['total_inertia']:.4f}")
                 with col2:
-                    dim2 = st.selectbox("Y-axis dimension", dim_options, index=1 if n_components_result > 1 else 0, key="mca_dim2")
+                    total_explained = sum(model_result['var_explained_pct'][:model_result['n_components']])
+                    st.metric("Total Explained", f"{total_explained:.1f}%")
                 
-                fig = plot_mca_biplot(
-                    mca_result['row_coordinates'],
-                    mca_result['column_coordinates'],
-                    mca_result['product_labels'],
-                    dim1=dim1,
-                    dim2=dim2,
-                    var_explained=list(mca_result['var_explained_pct'])
+                fig = plot_variance_explained(model_result['var_explained_pct'], "MCA")
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Product contributions
+                st.subheader("Product Contributions to Dimensions")
+                st.caption("Higher contribution = product is more important in defining that dimension")
+                
+                fig = plot_mca_contributions(
+                    model_result['contributions'],
+                    model_result['product_labels'],
+                    n_dims=min(3, model_result['n_components'])
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Product coordinates (loadings equivalent)
+                st.subheader("Product Coordinates (Dimension Loadings)")
+                dim_labels = [f"Dim {k+1}" for k in range(model_result['n_components'])]
+                fig = plot_loadings_heatmap(
+                    model_result['column_coordinates'],
+                    model_result['product_labels'],
+                    dim_labels,
+                    "Product Coordinates in MCA Space"
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Product similarity
+                st.subheader("Product Similarity (from MCA)")
+                fig = plot_correlation_matrix(
+                    model_result['similarity_matrix'],
+                    model_result['product_labels'],
+                    "Product Similarity (cosine in MCA space)"
                 )
                 st.plotly_chart(fig, use_container_width=True)
             
-            # Product contributions
-            st.subheader("Product Contributions to Dimensions")
-            st.caption("Higher contribution = product is more important in defining that dimension")
+            # =========== BIPLOT SECTION (for all models with embeddings) ===========
+            if product_embeddings is not None and product_embeddings.shape[1] >= 2:
+                st.markdown("---")
+                st.subheader("🎯 Product Biplot")
+                st.caption("Explore products in the latent space. Products close together have similar patterns.")
+                
+                n_dims = product_embeddings.shape[1]
+                dim_options = list(range(n_dims))
+                
+                col1, col2, col3 = st.columns([1, 1, 1])
+                with col1:
+                    dim1 = st.selectbox("X-axis dimension", dim_options, index=0, key="biplot_dim1")
+                with col2:
+                    dim2 = st.selectbox("Y-axis dimension", dim_options, 
+                                       index=1 if n_dims > 1 else 0, key="biplot_dim2")
+                with col3:
+                    show_households = st.checkbox("Show households", value=True, key="show_hh",
+                                                  help="Show household points in the biplot")
+                
+                # Get cluster labels if available
+                cluster_labels = None
+                if st.session_state.cluster_result is not None:
+                    cluster_labels = st.session_state.cluster_result['labels']
+                
+                # Handle MCA product labels
+                if model_type == "Multiple Correspondence Analysis (MCA)":
+                    prod_labels = model_result['product_labels']
+                else:
+                    prod_labels = product_columns_cached
+                
+                fig = plot_generic_biplot(
+                    row_coords=household_embeddings if show_households else None,
+                    col_coords=product_embeddings,
+                    product_labels=prod_labels,
+                    dim1=dim1,
+                    dim2=dim2,
+                    var_explained=list(var_explained) if var_explained is not None else None,
+                    model_name=model_type.split(" (")[0],  # Clean model name
+                    cluster_labels=cluster_labels,
+                    show_households=show_households
+                )
+                st.plotly_chart(fig, use_container_width=True)
             
-            fig = plot_mca_contributions(
-                mca_result['contributions'],
-                mca_result['product_labels'],
-                n_dims=min(3, n_components_result)
-            )
-            st.plotly_chart(fig, use_container_width=True)
+            # =========== PRODUCT CLUSTERING SECTION ===========
+            if product_embeddings is not None:
+                st.markdown("---")
+                st.subheader("🔮 Product Clustering")
+                st.caption("Cluster products based on their positions in the latent space.")
+                
+                col1, col2, col3 = st.columns([1, 1, 1])
+                
+                with col1:
+                    cluster_method = st.selectbox(
+                        "Clustering method",
+                        options=["K-Means", "Hierarchical"],
+                        key="cluster_method"
+                    )
+                
+                with col2:
+                    max_k = min(10, len(product_columns_cached) - 1)
+                    if max_k >= 2:
+                        auto_k = st.checkbox("Auto-detect optimal K", value=False, key="auto_k")
+                    else:
+                        auto_k = False
+                
+                with col3:
+                    if not auto_k and max_k >= 2:
+                        n_clusters = st.slider("Number of clusters", 2, max_k, 
+                                              min(3, max_k), key="n_clusters")
+                    else:
+                        n_clusters = 2
+                
+                if max_k >= 2:
+                    if st.button("🔄 Run Clustering", key="run_clustering"):
+                        with st.spinner("Clustering products..."):
+                            if auto_k:
+                                # Find optimal K
+                                opt_result = find_optimal_clusters(product_embeddings, max_k)
+                                n_clusters = opt_result['optimal_k']
+                                st.info(f"Optimal number of clusters: {n_clusters} (based on silhouette score)")
+                                
+                                # Show silhouette scores
+                                if len(opt_result['scores']) > 0:
+                                    fig = go.Figure()
+                                    fig.add_trace(go.Scatter(
+                                        x=opt_result['range'],
+                                        y=opt_result['scores'],
+                                        mode='lines+markers',
+                                        name='Silhouette Score'
+                                    ))
+                                    fig.add_vline(x=n_clusters, line_dash="dash", line_color="red",
+                                                 annotation_text=f"Optimal K={n_clusters}")
+                                    fig.update_layout(
+                                        title='Silhouette Score by Number of Clusters',
+                                        xaxis_title='Number of Clusters (K)',
+                                        yaxis_title='Silhouette Score',
+                                        height=300
+                                    )
+                                    st.plotly_chart(fig, use_container_width=True)
+                            
+                            # Run clustering
+                            if cluster_method == "K-Means":
+                                cluster_result = cluster_products_kmeans(product_embeddings, n_clusters)
+                            else:
+                                cluster_result = cluster_products_hierarchical(
+                                    product_embeddings, n_clusters, method='ward'
+                                )
+                            
+                            st.session_state.cluster_result = cluster_result
+                    
+                    # Display clustering results if available
+                    if st.session_state.cluster_result is not None:
+                        cluster_result = st.session_state.cluster_result
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.metric("Number of Clusters", cluster_result['n_clusters'])
+                        with col2:
+                            if cluster_result.get('silhouette') is not None:
+                                st.metric("Silhouette Score", f"{cluster_result['silhouette']:.3f}")
+                            else:
+                                st.metric("Silhouette Score", "N/A")
+                        
+                        # Show cluster membership
+                        st.subheader("Cluster Membership")
+                        if model_type == "Multiple Correspondence Analysis (MCA)":
+                            prod_labels = model_result['product_labels']
+                        else:
+                            prod_labels = product_columns_cached
+                        
+                        cluster_df = get_cluster_members(cluster_result['labels'], prod_labels)
+                        
+                        # Display as columns for each cluster
+                        n_clusters_actual = cluster_result['n_clusters']
+                        cols = st.columns(min(n_clusters_actual, 4))
+                        for i in range(n_clusters_actual):
+                            with cols[i % len(cols)]:
+                                cluster_products = cluster_df[cluster_df['Cluster'] == i + 1]['Product'].tolist()
+                                st.markdown(f"**Cluster {i + 1}** ({len(cluster_products)} products)")
+                                for prod in cluster_products:
+                                    st.write(f"• {prod}")
+                        
+                        # Cluster summary visualization
+                        fig = plot_cluster_summary(
+                            product_embeddings, 
+                            cluster_result['labels'],
+                            prod_labels,
+                            title="Cluster Summary"
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.warning("Need at least 3 products to perform clustering.")
             
-            # Product coordinates (loadings equivalent)
-            st.subheader("Product Coordinates (Dimension Loadings)")
-            dim_labels = [f"Dim {k+1}" for k in range(n_components_result)]
-            loadings_df = pd.DataFrame(
-                mca_result['column_coordinates'],
-                index=mca_result['product_labels'],
-                columns=dim_labels
-            )
-            fig = plot_loadings_heatmap(
-                mca_result['column_coordinates'],
-                mca_result['product_labels'],
-                dim_labels,
-                "Product Coordinates in MCA Space"
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Product similarity
-            st.subheader("Product Similarity (from MCA)")
-            fig = plot_correlation_matrix(
-                mca_result['similarity_matrix'],
-                mca_result['product_labels'],
-                "Product Similarity (cosine in MCA space)"
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Hierarchical clustering for MCA
-            if show_hierarchy and st.session_state.mca_similarity_matrix is not None:
+            # =========== HIERARCHICAL CLUSTERING / DENDROGRAM ===========
+            if show_hierarchy and similarity_matrix is not None:
+                st.markdown("---")
                 st.subheader("🌳 Hierarchical Product Relationships")
-                hc_result = compute_hierarchical_clustering(st.session_state.mca_similarity_matrix, method=linkage_method)
-                fig = plot_dendrogram(hc_result['linkage_matrix'], product_columns_cached,
-                                      f"Product Hierarchy (MCA)")
+                hc_result = compute_hierarchical_clustering(similarity_matrix, method=linkage_method)
+                
+                if model_type == "Multiple Correspondence Analysis (MCA)":
+                    prod_labels = model_result['product_labels']
+                else:
+                    prod_labels = product_columns_cached
+                
+                fig = plot_dendrogram(hc_result['linkage_matrix'], prod_labels,
+                                      f"Product Hierarchy ({model_type.split(' (')[0]})")
                 st.plotly_chart(fig, use_container_width=True)
                 
                 st.markdown("""
@@ -1734,6 +2241,20 @@ def main():
             | **Bayesian FA (PyMC)** | Full uncertainty | Posteriors + credible intervals |
             | **Discrete Choice (PyMC)** | Understanding drivers | Feature coefficients |
             
+            ### Biplot Interpretation
+            
+            - **Product positions**: Products close together have similar purchase patterns
+            - **Household points**: Show where individual households fall in the latent space
+            - **Dimensions**: Each axis represents a latent factor or component
+            - **Variance explained**: Shows how much information each dimension captures
+            
+            ### Product Clustering
+            
+            - **K-Means**: Partitions products into K non-overlapping clusters
+            - **Hierarchical**: Creates a tree of clusters (use dendrogram to visualize)
+            - **Silhouette Score**: Measures cluster quality (-1 to 1, higher is better)
+            - **Auto-detect K**: Uses silhouette score to find optimal number of clusters
+            
             ### MCA Interpretation
             
             - **Biplot**: Products close together → similar purchase patterns. Households near a product → likely buyers.
@@ -1746,6 +2267,7 @@ def main():
             - **Hierarchical clustering**: Use to identify natural product groupings
             - **Negative residual correlations** in LCA suggest substitution patterns
             - **High loadings** on multiple factors suggest products that bridge categories
+            - **Cluster products** to create actionable segments for marketing/assortment
             """)
 
 
