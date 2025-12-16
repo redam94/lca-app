@@ -41,7 +41,7 @@ except ImportError:
 PYMC_AVAILABLE = False
 PYMC_ERROR = None
 try:
-    import pytensor
+    import pytensor.tensor as pt
     import pymc as pm
     import arviz as az
     PYMC_AVAILABLE = True
@@ -888,59 +888,166 @@ def fit_mca(data: np.ndarray, n_components: int, product_names: list = None) -> 
 # BAYESIAN FACTOR MODEL (PyMC - Full MCMC)
 # =============================================================================
 
-def fit_bayesian_factor_model_pymc(data: np.ndarray, n_factors: int, 
+def fit_bayesian_factor_model_pymc(data: np.ndarray, n_factors: int,
                                     n_samples: int = 1000, n_tune: int = 500) -> dict:
-    """Bayesian Factor Model using PyMC with MCMC sampling."""
+    """
+    Bayesian Factor Model using PyMC with lower triangular identification.
+    
+    This parameterization eliminates rotational invariance by constraining:
+    - The first n_factors x n_factors block of loadings to be lower triangular
+    - Diagonal elements to be positive (via LogNormal prior)
+    - Upper triangular elements (in that block) to be exactly zero
+    
+    Parameters
+    ----------
+    data : np.ndarray
+        Data matrix of shape (n_obs, n_items)
+    n_factors : int
+        Number of latent factors
+    n_samples : int
+        Number of MCMC samples after tuning
+    n_tune : int
+        Number of tuning/warmup samples
+        
+    Returns
+    -------
+    dict with keys:
+        - loadings: Posterior mean of factor loadings (n_items, n_factors)
+        - loadings_std: Posterior std of factor loadings
+        - var_explained: Variance explained by each factor
+        - var_explained_pct: Variance explained as percentage
+        - trace: Full PyMC InferenceData object
+        - waic: WAIC model comparison metric
+        - n_divergences: Number of divergent transitions
+    """
     if not PYMC_AVAILABLE:
-        raise ImportError("PyMC is not available")
+        raise ImportError("PyMC is not available. Install with: pip install pymc")
     
     n_obs, n_items = data.shape
     
+    if n_items < n_factors:
+        raise ValueError(f"Need at least {n_factors} items for {n_factors} factors, got {n_items}")
+    
+    # Precompute indices for building the loadings matrix
+    # This avoids Python loops inside the PyMC model
+    
+    # Diagonal indices: (0,0), (1,1), ..., (n_factors-1, n_factors-1)
+    diag_rows = list(range(n_factors))
+    diag_cols = list(range(n_factors))
+    
+    # Lower triangular indices (below diagonal) for first n_factors rows
+    # (1,0), (2,0), (2,1), (3,0), (3,1), (3,2), ...
+    lower_rows = []
+    lower_cols = []
+    for i in range(1, n_factors):
+        for j in range(i):
+            lower_rows.append(i)
+            lower_cols.append(j)
+    n_lower = len(lower_rows)
+    
+    # Remaining rows indices: rows n_factors to n_items-1, all columns
+    remaining_rows = []
+    remaining_cols = []
+    for i in range(n_factors, n_items):
+        for j in range(n_factors):
+            remaining_rows.append(i)
+            remaining_cols.append(j)
+    n_remaining = len(remaining_rows)
+    
     with pm.Model() as factor_model:
-        # Factor loadings with hierarchical prior
-        loadings_sd = pm.HalfNormal('loadings_sd', sigma=1.0)
-        loadings = pm.Normal('loadings', mu=0, sigma=loadings_sd, 
-                            shape=(n_items, n_factors))
+        # === LOADINGS WITH IDENTIFICATION CONSTRAINTS ===
         
-        # Latent factors (standardized)
+        # 1. Diagonal elements: positive (ensures unique orientation per factor)
+        #    LogNormal(0, 0.5) has mean ≈ 1.13, reasonable for standardized loadings
+        diag_loadings = pm.LogNormal('diag_loadings', mu=0, sigma=0.5, shape=n_factors)
+        
+        # 2. Lower triangular elements (below diagonal): free parameters
+        if n_lower > 0:
+            lower_loadings = pm.Normal('lower_loadings', mu=0, sigma=1.0, shape=n_lower)
+        
+        # 3. Remaining rows: all elements free
+        if n_remaining > 0:
+            remaining_loadings = pm.Normal('remaining_loadings', mu=0, sigma=1.0, shape=n_remaining)
+        
+        # === BUILD LOADINGS MATRIX USING ADVANCED INDEXING ===
+        # Start with zeros
+        loadings_flat = pt.zeros(n_items * n_factors)
+        
+        # Convert 2D indices to flat indices
+        diag_flat_idx = [r * n_factors + c for r, c in zip(diag_rows, diag_cols)]
+        loadings_flat = pt.set_subtensor(loadings_flat[diag_flat_idx], diag_loadings)
+        
+        if n_lower > 0:
+            lower_flat_idx = [r * n_factors + c for r, c in zip(lower_rows, lower_cols)]
+            loadings_flat = pt.set_subtensor(loadings_flat[lower_flat_idx], lower_loadings)
+        
+        if n_remaining > 0:
+            remaining_flat_idx = [r * n_factors + c for r, c in zip(remaining_rows, remaining_cols)]
+            loadings_flat = pt.set_subtensor(loadings_flat[remaining_flat_idx], remaining_loadings)
+        
+        # Reshape to matrix
+        loadings = loadings_flat.reshape((n_items, n_factors))
+        
+        # === LATENT FACTORS ===
+        # Standard normal prior (identified because loadings handle scaling)
         factors = pm.Normal('factors', mu=0, sigma=1, shape=(n_obs, n_factors))
         
-        # Observation noise
+        # === OBSERVATION NOISE ===
+        # Item-specific noise (uniquenesses)
         sigma = pm.HalfNormal('sigma', sigma=1.0, shape=n_items)
         
-        # Likelihood
+        # === LIKELIHOOD ===
         mu = pm.math.dot(factors, loadings.T)
         likelihood = pm.Normal('obs', mu=mu, sigma=sigma, observed=data)
         
-        # Sample
-        trace = pm.sample(n_samples, tune=n_tune, nuts_sampler='nutpie', 
-                         progressbar=True, return_inferencedata=True,
-                         target_accept=0.9)
+        # === SAMPLE ===
+        trace = pm.sample(
+            n_samples, 
+            tune=n_tune, 
+            nuts_sampler='nutpie',
+            progressbar=True, 
+            return_inferencedata=True,
+            target_accept=0.95,  # Higher acceptance for better mixing
+            random_seed=42
+        )
+        
+        # Compute log likelihood for WAIC
         trace = pm.compute_log_likelihood(trace)
     
-    # Extract posterior means
-    loadings_samples = trace.posterior['loadings'].values.reshape(-1, n_items, n_factors)
+    # === RECONSTRUCT LOADINGS FROM POSTERIOR SAMPLES ===
+    loadings_samples = _reconstruct_loadings_samples(
+        trace, n_items, n_factors, n_lower, n_remaining,
+        diag_flat_idx, 
+        lower_flat_idx if n_lower > 0 else [],
+        remaining_flat_idx if n_remaining > 0 else []
+    )
+    
+    # Posterior statistics
     loadings_mean = loadings_samples.mean(axis=0)
     loadings_std = loadings_samples.std(axis=0)
     
-    # Apply varimax rotation
-    loadings_rotated = varimax_rotation(loadings_mean)
-    
-    # Variance explained
-    var_explained = np.sum(loadings_rotated ** 2, axis=0)
+    # Variance explained (sum of squared loadings per factor)
+    var_explained = np.sum(loadings_mean ** 2, axis=0)
     var_explained_pct = var_explained / n_items * 100
     
-    # WAIC
+    # Sort factors by variance explained (descending)
+    sort_idx = np.argsort(var_explained)[::-1]
+    loadings_mean = loadings_mean[:, sort_idx]
+    loadings_std = loadings_std[:, sort_idx]
+    var_explained = var_explained[sort_idx]
+    var_explained_pct = var_explained_pct[sort_idx]
+    
+    # WAIC for model comparison
     try:
         waic = az.waic(trace)
-    except:
+    except Exception:
         waic = None
     
     # Check for divergences
-    n_divergences = trace.sample_stats['diverging'].sum().values.item()
+    n_divergences = int(trace.sample_stats['diverging'].sum().values)
     
     return {
-        'loadings': loadings_rotated,
+        'loadings': loadings_mean,
         'loadings_std': loadings_std,
         'var_explained': var_explained,
         'var_explained_pct': var_explained_pct,
@@ -948,6 +1055,64 @@ def fit_bayesian_factor_model_pymc(data: np.ndarray, n_factors: int,
         'waic': waic,
         'n_divergences': n_divergences
     }
+
+
+def _reconstruct_loadings_samples(trace, n_items, n_factors, n_lower, n_remaining,
+                                   diag_idx, lower_idx, remaining_idx):
+    """
+    Reconstruct the full loadings matrix from the constrained posterior samples.
+    
+    Returns array of shape (n_samples, n_items, n_factors)
+    """
+    # Get samples - shape is (n_chains, n_draws, n_params)
+    diag_samples = trace.posterior['diag_loadings'].values
+    n_chains, n_draws = diag_samples.shape[:2]
+    n_total_samples = n_chains * n_draws
+    
+    # Flatten chains
+    diag_samples = diag_samples.reshape(n_total_samples, n_factors)
+    
+    if n_lower > 0:
+        lower_samples = trace.posterior['lower_loadings'].values.reshape(n_total_samples, n_lower)
+    
+    if n_remaining > 0:
+        remaining_samples = trace.posterior['remaining_loadings'].values.reshape(n_total_samples, n_remaining)
+    
+    # Reconstruct full loadings for each sample
+    loadings_samples = np.zeros((n_total_samples, n_items, n_factors))
+    
+    for s in range(n_total_samples):
+        flat = np.zeros(n_items * n_factors)
+        
+        # Fill diagonal
+        flat[diag_idx] = diag_samples[s]
+        
+        # Fill lower triangle
+        if n_lower > 0:
+            flat[lower_idx] = lower_samples[s]
+        
+        # Fill remaining
+        if n_remaining > 0:
+            flat[remaining_idx] = remaining_samples[s]
+        
+        loadings_samples[s] = flat.reshape(n_items, n_factors)
+    
+    return loadings_samples
+
+
+def compute_factor_scores_regression(data: np.ndarray, loadings: np.ndarray) -> np.ndarray:
+    """
+    Compute factor scores using the regression (Thurstone) method.
+    
+    scores = data @ loadings @ (loadings.T @ loadings)^{-1}
+    """
+    cov_factors = loadings.T @ loadings
+    try:
+        cov_inv = np.linalg.inv(cov_factors)
+    except np.linalg.LinAlgError:
+        cov_inv = np.linalg.pinv(cov_factors)
+    
+    return data @ loadings @ cov_inv
 
 
 # =============================================================================
@@ -962,35 +1127,79 @@ def fit_discrete_choice_model_pymc(data: np.ndarray, product_columns: list,
                                     n_latent_features: int = 0,
                                     latent_prior_scale: float = 1.0) -> dict:
     """
-    Discrete Choice Model using PyMC.
+    Discrete Choice Model using PyMC with identified latent features.
     
-    Args:
-        data: Binary purchase matrix (n_households x n_products)
-        product_columns: List of product names
-        household_features: Optional household-level features
-        product_features: Optional product-level features
-        n_samples: Number of MCMC samples
-        n_tune: Number of tuning samples
-        include_random_effects: Whether to include household random effects
-        n_latent_features: Number of latent product dimensions (0 = no latent features)
-        latent_prior_scale: Prior scale for latent features (controls regularization)
+    When n_latent_features > 0, the model learns:
+    - Product latent features (Λ): Lower triangular with positive diagonal for identification
+    - Household latent preferences (Θ): Free parameters (identification handled by Λ)
+    - Utility contribution: Θ × Λᵀ
     
-    Returns:
-        Dictionary with model results including latent features if enabled
+    Parameters
+    ----------
+    data : np.ndarray
+        Binary purchase matrix (n_households x n_products)
+    product_columns : list
+        List of product names
+    household_features : np.ndarray, optional
+        Household-level features (n_households x n_hh_features)
+    product_features : np.ndarray, optional
+        Product-level features (n_products x n_prod_features)
+    n_samples : int
+        Number of MCMC samples after tuning
+    n_tune : int
+        Number of tuning samples
+    include_random_effects : bool
+        Whether to include household random effects
+    n_latent_features : int
+        Number of latent product dimensions (0 = no latent features)
+    latent_prior_scale : float
+        Prior scale for latent features (controls regularization)
+        
+    Returns
+    -------
+    dict with model results including latent features if enabled
     """
     if not PYMC_AVAILABLE:
         raise ImportError("PyMC is not available")
     
     n_obs, n_items = data.shape
     
-    with pm.Model() as dcm:
-        # Product intercepts (baseline purchase probability)
-        alpha = pm.Normal('alpha', mu=0, sigma=2, shape=n_items)
+    # Precompute indices for lower triangular latent features (if needed)
+    if n_latent_features > 0:
+        if n_items < n_latent_features:
+            raise ValueError(f"Need at least {n_latent_features} products for {n_latent_features} latent features")
         
-        # Utility calculation
+        # Diagonal indices for product_latent
+        latent_diag_rows = list(range(n_latent_features))
+        latent_diag_cols = list(range(n_latent_features))
+        latent_diag_flat_idx = [r * n_latent_features + c for r, c in zip(latent_diag_rows, latent_diag_cols)]
+        
+        # Lower triangular indices (below diagonal)
+        latent_lower_rows = []
+        latent_lower_cols = []
+        for i in range(1, n_latent_features):
+            for j in range(i):
+                latent_lower_rows.append(i)
+                latent_lower_cols.append(j)
+        n_latent_lower = len(latent_lower_rows)
+        latent_lower_flat_idx = [r * n_latent_features + c for r, c in zip(latent_lower_rows, latent_lower_cols)]
+        
+        # Remaining rows (products n_latent_features to n_items-1)
+        latent_remaining_rows = []
+        latent_remaining_cols = []
+        for i in range(n_latent_features, n_items):
+            for j in range(n_latent_features):
+                latent_remaining_rows.append(i)
+                latent_remaining_cols.append(j)
+        n_latent_remaining = len(latent_remaining_rows)
+        latent_remaining_flat_idx = [r * n_latent_features + c for r, c in zip(latent_remaining_rows, latent_remaining_cols)]
+    
+    with pm.Model() as dcm:
+        # === PRODUCT INTERCEPTS ===
+        alpha = pm.Normal('alpha', mu=0, sigma=2, shape=n_items)
         utility = alpha
         
-        # Household feature effects
+        # === HOUSEHOLD FEATURE EFFECTS ===
         if household_features is not None:
             n_hh_features = household_features.shape[1]
             # Non-centered parameterization
@@ -1001,103 +1210,169 @@ def fit_discrete_choice_model_pymc(data: np.ndarray, product_columns: list,
             hh_effect = pm.math.dot(household_features, beta.T)
             utility = utility + hh_effect
         
-        # Product feature effects
+        # === PRODUCT FEATURE EFFECTS ===
         if product_features is not None:
             n_prod_features = product_features.shape[1]
             gamma = pm.Normal('gamma', mu=0, sigma=2, shape=n_prod_features)
             prod_effect = pm.math.dot(product_features, gamma)
             utility = utility + prod_effect
         
-        # Latent product features (matrix factorization component)
+        # === LATENT FEATURES WITH IDENTIFICATION ===
         if n_latent_features > 0:
-            # Product latent features (loadings) - what latent attributes each product has
-            # Use hierarchical prior for regularization
-            lambda_sd = pm.HalfNormal('lambda_sd', sigma=latent_prior_scale)
-            product_latent_raw = pm.Normal('product_latent_raw', mu=0, sigma=1, 
-                                           shape=(n_items, n_latent_features))
-            product_latent = pm.Deterministic('product_latent', product_latent_raw * lambda_sd)
+            # --- Product Latent Features (Λ): Lower triangular with positive diagonal ---
             
-            # Household latent preferences - how much each household values each latent attribute
-            # Use hierarchical prior for regularization
+            # Diagonal elements: positive (LogNormal)
+            lambda_diag = pm.LogNormal('lambda_diag', mu=0, sigma=0.5 * latent_prior_scale, 
+                                        shape=n_latent_features)
+            
+            # Lower triangular elements (below diagonal)
+            if n_latent_lower > 0:
+                lambda_lower = pm.Normal('lambda_lower', mu=0, sigma=latent_prior_scale, 
+                                          shape=n_latent_lower)
+            
+            # Remaining rows (all elements free)
+            if n_latent_remaining > 0:
+                lambda_remaining = pm.Normal('lambda_remaining', mu=0, sigma=latent_prior_scale,
+                                              shape=n_latent_remaining)
+            
+            # Build the product_latent matrix
+            lambda_flat = pt.zeros(n_items * n_latent_features)
+            lambda_flat = pt.set_subtensor(lambda_flat[latent_diag_flat_idx], lambda_diag)
+            if n_latent_lower > 0:
+                lambda_flat = pt.set_subtensor(lambda_flat[latent_lower_flat_idx], lambda_lower)
+            if n_latent_remaining > 0:
+                lambda_flat = pt.set_subtensor(lambda_flat[latent_remaining_flat_idx], lambda_remaining)
+            
+            product_latent = lambda_flat.reshape((n_items, n_latent_features))
+            
+            # --- Household Latent Preferences (Θ): Free (identification via Λ) ---
             theta_sd = pm.HalfNormal('theta_sd', sigma=latent_prior_scale)
             household_latent_raw = pm.Normal('household_latent_raw', mu=0, sigma=1,
                                               shape=(n_obs, n_latent_features))
             household_latent = pm.Deterministic('household_latent', household_latent_raw * theta_sd)
             
-            # Latent interaction: household preferences × product features
+            # Latent utility contribution: Θ × Λᵀ
             latent_utility = pm.math.dot(household_latent, product_latent.T)
             utility = utility + latent_utility
         
-        # Household random effects
+        # === HOUSEHOLD RANDOM EFFECTS ===
         if include_random_effects:
             sigma_hh = pm.HalfNormal('sigma_hh', sigma=1.0)
-            hh_re_raw = pm.Normal('hh_re_raw', mu=0, sigma=1, shape=n_obs)
-            hh_re = pm.Deterministic('hh_re', hh_re_raw * sigma_hh)
-            utility = utility + hh_re[:, None]
+            hh_effect_raw = pm.Normal('hh_effect_raw', mu=0, sigma=1, shape=n_obs)
+            hh_random = pm.Deterministic('hh_random', hh_effect_raw * sigma_hh)
+            utility = utility + hh_random[:, None]
         
-        # Probability via logistic
+        # === LIKELIHOOD ===
         p = pm.math.sigmoid(utility)
-        
-        # Likelihood
         likelihood = pm.Bernoulli('obs', p=p, observed=data)
         
-        # Sample
-        trace = pm.sample(n_samples, tune=n_tune, nuts_sampler='nutpie',
-                         progressbar=True, return_inferencedata=True,
-                         target_accept=0.95)
+        # === SAMPLE ===
+        trace = pm.sample(
+            n_samples, 
+            tune=n_tune, 
+            nuts_sampler='nutpie',
+            progressbar=True, 
+            return_inferencedata=True,
+            target_accept=0.95,
+            random_seed=42
+        )
         trace = pm.compute_log_likelihood(trace)
-        
-    # Extract results
-    alpha_samples = trace.posterior['alpha'].values.reshape(-1, n_items)
-    alpha_mean = alpha_samples.mean(axis=0)
-    alpha_std = alpha_samples.std(axis=0)
     
-    result = {
-        'alpha': alpha_mean,
-        'alpha_std': alpha_std,
+    # === EXTRACT RESULTS ===
+    results = {
+        'alpha': trace.posterior['alpha'].mean(dim=['chain', 'draw']).values,
+        'alpha_std': trace.posterior['alpha'].std(dim=['chain', 'draw']).values,
         'trace': trace,
-        'n_divergences': trace.sample_stats['diverging'].sum().values.item(),
-        'n_latent_features': n_latent_features
+        'n_divergences': int(trace.sample_stats['diverging'].sum().values)
     }
     
-    if household_features is not None:
-        beta_samples = trace.posterior['beta'].values.reshape(-1, n_items, n_hh_features)
-        result['beta'] = beta_samples.mean(axis=0)
-        result['beta_std'] = beta_samples.std(axis=0)
-    
-    if product_features is not None:
-        gamma_samples = trace.posterior['gamma'].values.reshape(-1, n_prod_features)
-        result['gamma'] = gamma_samples.mean(axis=0)
-        result['gamma_std'] = gamma_samples.std(axis=0)
-    
-    # Extract latent features
-    if n_latent_features > 0:
-        product_latent_samples = trace.posterior['product_latent'].values.reshape(-1, n_items, n_latent_features)
-        result['product_latent'] = product_latent_samples.mean(axis=0)
-        result['product_latent_std'] = product_latent_samples.std(axis=0)
-        
-        household_latent_samples = trace.posterior['household_latent'].values.reshape(-1, n_obs, n_latent_features)
-        result['household_latent'] = household_latent_samples.mean(axis=0)
-        result['household_latent_std'] = household_latent_samples.std(axis=0)
-        
-        # Extract scale parameters
-        lambda_sd_samples = trace.posterior['lambda_sd'].values.flatten()
-        theta_sd_samples = trace.posterior['theta_sd'].values.flatten()
-        result['lambda_sd'] = lambda_sd_samples.mean()
-        result['theta_sd'] = theta_sd_samples.mean()
-    
-    if include_random_effects:
-        sigma_hh_samples = trace.posterior['sigma_hh'].values.flatten()
-        result['sigma_hh'] = sigma_hh_samples.mean()
-        result['sigma_hh_std'] = sigma_hh_samples.std()
-    
+    # WAIC
     try:
-        result['waic'] = az.waic(trace)
-    except:
-        result['waic'] = None
+        with dcm:
+            trace = pm.compute_log_likelihood(trace)
+        import arviz as az
+        results['waic'] = az.waic(trace)
+    except Exception:
+        results['waic'] = None
     
-    return result
+    # Household feature effects
+    if household_features is not None:
+        results['beta'] = trace.posterior['beta'].mean(dim=['chain', 'draw']).values
+        results['beta_std'] = trace.posterior['beta'].std(dim=['chain', 'draw']).values
+    
+    # Product feature effects
+    if product_features is not None:
+        results['gamma'] = trace.posterior['gamma'].mean(dim=['chain', 'draw']).values
+        results['gamma_std'] = trace.posterior['gamma'].std(dim=['chain', 'draw']).values
+    
+    # Latent features
+    if n_latent_features > 0:
+        # Reconstruct product_latent from constrained parameters
+        product_latent_samples = _reconstruct_dcm_latent_samples(
+            trace, n_items, n_latent_features, n_latent_lower, n_latent_remaining,
+            latent_diag_flat_idx, 
+            latent_lower_flat_idx if n_latent_lower > 0 else [],
+            latent_remaining_flat_idx if n_latent_remaining > 0 else []
+        )
+        
+        results['product_latent'] = product_latent_samples.mean(axis=0)
+        results['product_latent_std'] = product_latent_samples.std(axis=0)
+        results['household_latent'] = trace.posterior['household_latent'].mean(dim=['chain', 'draw']).values
+        results['household_latent_std'] = trace.posterior['household_latent'].std(dim=['chain', 'draw']).values
+        results['theta_sd'] = float(trace.posterior['theta_sd'].mean().values)
+        results['n_latent_features'] = n_latent_features
+        
+        # Compute lambda_sd equivalent (average scale of diagonal)
+        results['lambda_sd'] = float(trace.posterior['lambda_diag'].mean().values)
+    
+    # Random effects
+    if include_random_effects:
+        results['sigma_hh'] = float(trace.posterior['sigma_hh'].mean().values)
+    
+    return results
 
+
+def _reconstruct_dcm_latent_samples(trace, n_items, n_latent_features, n_lower, n_remaining,
+                                     diag_idx, lower_idx, remaining_idx):
+    """
+    Reconstruct the full product_latent matrix from constrained posterior samples.
+    
+    Returns array of shape (n_samples, n_items, n_latent_features)
+    """
+    # Get samples - shape is (n_chains, n_draws, n_params)
+    diag_samples = trace.posterior['lambda_diag'].values
+    n_chains, n_draws = diag_samples.shape[:2]
+    n_total_samples = n_chains * n_draws
+    
+    # Flatten chains
+    diag_samples = diag_samples.reshape(n_total_samples, n_latent_features)
+    
+    if n_lower > 0:
+        lower_samples = trace.posterior['lambda_lower'].values.reshape(n_total_samples, n_lower)
+    
+    if n_remaining > 0:
+        remaining_samples = trace.posterior['lambda_remaining'].values.reshape(n_total_samples, n_remaining)
+    
+    # Reconstruct full matrix for each sample
+    latent_samples = np.zeros((n_total_samples, n_items, n_latent_features))
+    
+    for s in range(n_total_samples):
+        flat = np.zeros(n_items * n_latent_features)
+        
+        # Fill diagonal
+        flat[diag_idx] = diag_samples[s]
+        
+        # Fill lower triangle
+        if n_lower > 0:
+            flat[lower_idx] = lower_samples[s]
+        
+        # Fill remaining
+        if n_remaining > 0:
+            flat[remaining_idx] = remaining_samples[s]
+        
+        latent_samples[s] = flat.reshape(n_items, n_latent_features)
+    
+    return latent_samples
 
 # =============================================================================
 # CLUSTERING FUNCTIONS
