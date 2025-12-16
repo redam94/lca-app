@@ -1764,8 +1764,12 @@ def main():
                 st.session_state.var_explained_cached = bfa_result['var_explained_pct']
                 st.session_state.cluster_result = None
                 st.session_state.convergence_msg = "MCMC sampling complete!"
+                try:
+                    waic = bfa_result['waic'].elpd_waic
+                except Exception as e:
+                    waic = None
                 st.session_state.model_metrics = {
-                    'WAIC': bfa_result['waic'].elpd_waic if bfa_result.get('waic') else None,
+                    'WAIC': waic,
                     'Divergences': bfa_result.get('n_divergences', 0)
                 }
                 
@@ -1852,7 +1856,10 @@ def main():
                     product_embeddings = None
                     household_embeddings = None
                     similarity = None
-                
+                try:
+                    waic = bfa_result['waic'].elpd_waic
+                except Exception as e:
+                    waic = None
                 st.session_state.model_result = dcm_result
                 st.session_state.model_cache_key = current_cache_key
                 st.session_state.model_type_cached = model_type
@@ -1864,7 +1871,7 @@ def main():
                 st.session_state.cluster_result = None
                 st.session_state.convergence_msg = "MCMC sampling complete!"
                 st.session_state.model_metrics = {
-                    'WAIC': dcm_result['waic'].elpd_waic if dcm_result.get('waic') else None,
+                    'WAIC': waic,
                     'Divergences': dcm_result.get('n_divergences', 0)
                 }
                 
