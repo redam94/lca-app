@@ -379,9 +379,9 @@ def fit_bayesian_factor_model_pymc(data: np.ndarray, n_factors: int, n_samples: 
         prob = pm.math.sigmoid(pm.math.dot(scores, loadings.T))
         likelihood = pm.Bernoulli('obs', p=prob, observed=data)
         
-        trace = pm.sample(n_samples, tune=n_tune,
+        trace = pm.sample(n_samples, tune=n_tune, nuts_sampler='nutpie', 
                          return_inferencedata=True, progressbar=True,
-                         target_accept=0.9, nuts_sampler='nutpie')
+                         target_accept=0.9)
         trace = pm.compute_log_likelihood(trace)
     
     loadings_samples = trace.posterior['loadings'].values.reshape(-1, n_items, n_factors)
@@ -458,10 +458,9 @@ def fit_discrete_choice_model_pymc(data: np.ndarray, household_features: np.ndar
         prob = pm.math.sigmoid(utility)
         likelihood = pm.Bernoulli('obs', p=prob, observed=data)
         
-        trace = pm.sample(n_samples, tune=n_tune, nuts_sampler='nutpie',
+        trace = pm.sample(n_samples, tune=n_tune, cores=1,
                          return_inferencedata=True, progressbar=True,
                          target_accept=0.95)
-        trace = pm.compute_log_likelihood(trace)
     
     alpha_samples = trace.posterior['alpha'].values.reshape(-1, n_items)
     alpha_mean = alpha_samples.mean(axis=0)
@@ -483,6 +482,224 @@ def fit_discrete_choice_model_pymc(data: np.ndarray, household_features: np.ndar
         gamma_samples = trace.posterior['gamma'].values.reshape(-1, n_prod_features)
         result['gamma'] = gamma_samples.mean(axis=0)
         result['gamma_std'] = gamma_samples.std(axis=0)
+    
+    if include_random_effects:
+        result['sigma_hh'] = trace.posterior['sigma_hh'].values.mean()
+    
+    try:
+        result['waic'] = az.waic(trace)
+    except:
+        result['waic'] = None
+    
+    return result
+
+
+def fit_latent_factor_dcm_pymc(data: np.ndarray, n_factors: int,
+                                household_features: np.ndarray = None,
+                                include_random_effects: bool = True,
+                                n_samples: int = 1000, n_tune: int = 500) -> dict:
+    """
+    Fit a joint latent factor discrete choice model using PyMC.
+    
+    This model simultaneously estimates:
+    1. Latent product factors (like factor analysis)
+    2. Household preferences over those latent factors
+    3. Optional household-level random effects
+    
+    Model structure:
+    - Products have positions in a latent K-dimensional space (Lambda)
+    - Households have preferences over each latent dimension (theta)
+    - Utility = alpha + theta @ Lambda' + household_features @ beta + random_effects
+    - P(purchase) = sigmoid(utility)
+    """
+    if not PYMC_AVAILABLE:
+        raise ImportError("PyMC is not available")
+    
+    n_obs, n_items = data.shape
+    
+    with pm.Model() as model:
+        # Product intercepts (baseline purchase probability)
+        alpha = pm.Normal('alpha', mu=0, sigma=2, shape=n_items)
+        
+        # Latent product factors (K-dimensional embedding for each product)
+        # Using non-centered parameterization for better sampling
+        Lambda_raw = pm.Normal('Lambda_raw', mu=0, sigma=1, shape=(n_items, n_factors))
+        Lambda = pm.Deterministic('Lambda', Lambda_raw * 0.5)  # Scale down
+        
+        # Household preferences over latent factors
+        # Each household has a K-dimensional preference vector
+        theta_raw = pm.Normal('theta_raw', mu=0, sigma=1, shape=(n_obs, n_factors))
+        theta = pm.Deterministic('theta', theta_raw * 0.5)
+        
+        # Utility from latent factors: theta @ Lambda'
+        # Shape: (n_obs, n_factors) @ (n_factors, n_items) = (n_obs, n_items)
+        latent_utility = pm.math.dot(theta, Lambda.T)
+        
+        utility = alpha + latent_utility
+        
+        # Add household features if provided
+        if household_features is not None:
+            n_hh_features = household_features.shape[1]
+            hh_features_std = (household_features - household_features.mean(0)) / (household_features.std(0) + 1e-10)
+            
+            beta_raw = pm.Normal('beta_raw', mu=0, sigma=1, shape=(n_items, n_hh_features))
+            beta = pm.Deterministic('beta', beta_raw * 0.5)
+            
+            utility = utility + pm.math.dot(hh_features_std, beta.T)
+        
+        # Household random effects (additional heterogeneity)
+        if include_random_effects:
+            sigma_hh = pm.HalfNormal('sigma_hh', sigma=0.3)
+            hh_effect_raw = pm.Normal('hh_effect_raw', mu=0, sigma=1, shape=n_obs)
+            hh_effect = pm.Deterministic('hh_effect', hh_effect_raw * sigma_hh)
+            utility = utility + hh_effect[:, None]
+        
+        # Likelihood
+        prob = pm.math.sigmoid(utility)
+        likelihood = pm.Bernoulli('obs', p=prob, observed=data)
+        
+        # Sample
+        trace = pm.sample(n_samples, tune=n_tune, nuts_sampler='nutpie',
+                         return_inferencedata=True, progressbar=True,
+                         target_accept=0.95)
+        trace = pm.compute_log_likelihood(trace)
+    # Extract results
+    alpha_samples = trace.posterior['alpha'].values.reshape(-1, n_items)
+    Lambda_samples = trace.posterior['Lambda'].values.reshape(-1, n_items, n_factors)
+    theta_samples = trace.posterior['theta'].values.reshape(-1, n_obs, n_factors)
+    
+    result = {
+        'alpha': alpha_samples.mean(axis=0),
+        'alpha_std': alpha_samples.std(axis=0),
+        'Lambda': Lambda_samples.mean(axis=0),  # Product loadings
+        'Lambda_std': Lambda_samples.std(axis=0),
+        'theta': theta_samples.mean(axis=0),  # Household preferences
+        'theta_std': theta_samples.std(axis=0),
+        'trace': trace,
+        'n_factors': n_factors,
+        'n_divergences': trace.sample_stats.diverging.sum().values
+    }
+    
+    if household_features is not None:
+        beta_samples = trace.posterior['beta'].values.reshape(-1, n_items, household_features.shape[1])
+        result['beta'] = beta_samples.mean(axis=0)
+        result['beta_std'] = beta_samples.std(axis=0)
+    
+    if include_random_effects:
+        result['sigma_hh'] = trace.posterior['sigma_hh'].values.mean()
+    
+    try:
+        result['waic'] = az.waic(trace)
+    except:
+        result['waic'] = None
+    
+    # Compute variance explained by latent factors
+    Lambda_mean = result['Lambda']
+    var_explained = np.sum(Lambda_mean ** 2, axis=0)
+    total_var = np.sum(Lambda_mean ** 2)
+    result['var_explained_pct'] = var_explained / total_var * 100 if total_var > 0 else np.zeros(n_factors)
+    
+    return result
+
+
+def fit_dcm_with_latent_features(data: np.ndarray, latent_product_features: np.ndarray,
+                                  household_features: np.ndarray = None,
+                                  include_random_effects: bool = True,
+                                  include_interactions: bool = False,
+                                  n_samples: int = 1000, n_tune: int = 500) -> dict:
+    """
+    Fit discrete choice model using pre-computed latent product features.
+    
+    This is a two-stage approach:
+    1. First fit a factor model (FA, MCA, NMF) to get product embeddings
+    2. Use those embeddings as product features in DCM
+    
+    The model estimates:
+    - gamma: Coefficients for each latent dimension (shared across households)
+    - Optionally: interactions between household features and latent dimensions
+    """
+    if not PYMC_AVAILABLE:
+        raise ImportError("PyMC is not available")
+    
+    n_obs, n_items = data.shape
+    n_latent = latent_product_features.shape[1]
+    
+    # Standardize latent features
+    latent_std = (latent_product_features - latent_product_features.mean(0)) / (latent_product_features.std(0) + 1e-10)
+    
+    with pm.Model() as model:
+        # Product intercepts
+        alpha = pm.Normal('alpha', mu=0, sigma=2, shape=n_items)
+        
+        # Coefficients for latent product features
+        # gamma: effect of each latent dimension on utility
+        gamma = pm.Normal('gamma', mu=0, sigma=1, shape=n_latent)
+        latent_effect = pm.math.dot(latent_std, gamma)  # (n_items,)
+        
+        utility = alpha + latent_effect
+        
+        # Household features
+        if household_features is not None:
+            n_hh_features = household_features.shape[1]
+            hh_features_std = (household_features - household_features.mean(0)) / (household_features.std(0) + 1e-10)
+            
+            # Main effects of household features
+            beta_raw = pm.Normal('beta_raw', mu=0, sigma=1, shape=(n_items, n_hh_features))
+            beta = pm.Deterministic('beta', beta_raw * 0.5)
+            utility = utility + pm.math.dot(hh_features_std, beta.T)
+            
+            # Interactions: household preferences over latent dimensions
+            if include_interactions:
+                # delta[k, f] = interaction between latent dim k and household feature f
+                delta = pm.Normal('delta', mu=0, sigma=0.5, shape=(n_latent, n_hh_features))
+                
+                # For each household, compute preference-weighted latent effects
+                # hh_features_std: (n_obs, n_hh_features)
+                # delta: (n_latent, n_hh_features)
+                # latent_std: (n_items, n_latent)
+                
+                # Household-specific latent preferences: (n_obs, n_latent)
+                hh_latent_pref = pm.math.dot(hh_features_std, delta.T)
+                
+                # Interaction utility: (n_obs, n_items)
+                interaction_utility = pm.math.dot(hh_latent_pref, latent_std.T)
+                utility = utility + interaction_utility
+        
+        # Random effects
+        if include_random_effects:
+            sigma_hh = pm.HalfNormal('sigma_hh', sigma=0.5)
+            hh_effect_raw = pm.Normal('hh_effect_raw', mu=0, sigma=1, shape=n_obs)
+            hh_effect = pm.Deterministic('hh_effect', hh_effect_raw * sigma_hh)
+            utility = utility + hh_effect[:, None]
+        
+        prob = pm.math.sigmoid(utility)
+        likelihood = pm.Bernoulli('obs', p=prob, observed=data)
+        
+        trace = pm.sample(n_samples, tune=n_tune,
+                         return_inferencedata=True, progressbar=True,
+                         target_accept=0.95, nuts_sampler='nutpie')
+        trace = pm.compute_log_likelihood(trace)
+    # Extract results
+    result = {
+        'alpha': trace.posterior['alpha'].values.reshape(-1, n_items).mean(axis=0),
+        'alpha_std': trace.posterior['alpha'].values.reshape(-1, n_items).std(axis=0),
+        'gamma': trace.posterior['gamma'].values.reshape(-1, n_latent).mean(axis=0),
+        'gamma_std': trace.posterior['gamma'].values.reshape(-1, n_latent).std(axis=0),
+        'trace': trace,
+        'n_latent': n_latent,
+        'n_divergences': trace.sample_stats.diverging.sum().values
+    }
+    
+    if household_features is not None:
+        n_hh_features = household_features.shape[1]
+        beta_samples = trace.posterior['beta'].values.reshape(-1, n_items, n_hh_features)
+        result['beta'] = beta_samples.mean(axis=0)
+        result['beta_std'] = beta_samples.std(axis=0)
+        
+        if include_interactions:
+            delta_samples = trace.posterior['delta'].values.reshape(-1, n_latent, n_hh_features)
+            result['delta'] = delta_samples.mean(axis=0)
+            result['delta_std'] = delta_samples.std(axis=0)
     
     if include_random_effects:
         result['sigma_hh'] = trace.posterior['sigma_hh'].values.mean()
@@ -1345,6 +1562,11 @@ def main():
         st.session_state.var_explained_cached = None
     if 'cluster_result' not in st.session_state:
         st.session_state.cluster_result = None
+    # Store latent product features for use in DCM
+    if 'latent_product_features' not in st.session_state:
+        st.session_state.latent_product_features = None
+    if 'latent_feature_source' not in st.session_state:
+        st.session_state.latent_feature_source = None
     
     # Check PyMC availability
     if not PYMC_AVAILABLE:
@@ -1533,6 +1755,54 @@ def main():
                 n_tune = st.slider("Tuning Samples", 200, 1000, 500)
             with col3:
                 include_random_effects = st.checkbox("Include household random effects", value=True)
+            
+            # Latent product features options
+            st.markdown("---")
+            st.subheader("🔮 Latent Product Features")
+            
+            dcm_latent_mode = st.radio(
+                "How to incorporate latent product structure?",
+                options=[
+                    "None (standard DCM)",
+                    "Use pre-computed latent features (two-stage)",
+                    "Joint estimation (estimate latent factors in DCM)"
+                ],
+                help="""
+                **None**: Standard discrete choice model with product intercepts only.
+                **Two-stage**: Use product embeddings from a previously fitted factor model (FA, MCA, NMF).
+                **Joint**: Simultaneously estimate latent product factors and choice parameters.
+                """
+            )
+            
+            use_latent_features = False
+            use_joint_estimation = False
+            include_interactions = False
+            n_latent_factors = 2
+            
+            if dcm_latent_mode == "Use pre-computed latent features (two-stage)":
+                use_latent_features = True
+                if st.session_state.latent_product_features is not None:
+                    st.success(f"✅ Latent features available from: {st.session_state.latent_feature_source}")
+                    st.write(f"   Shape: {st.session_state.latent_product_features.shape[1]} dimensions")
+                    
+                    include_interactions = st.checkbox(
+                        "Include household × latent dimension interactions",
+                        value=False,
+                        help="Allow household features to interact with latent product dimensions"
+                    )
+                else:
+                    st.warning("⚠️ No latent features available. First run a factor model (FA, MCA, or NMF) to generate product embeddings.")
+                    use_latent_features = False
+            
+            elif dcm_latent_mode == "Joint estimation (estimate latent factors in DCM)":
+                use_joint_estimation = True
+                n_latent_factors = st.slider(
+                    "Number of latent factors",
+                    min_value=1,
+                    max_value=min(5, len(product_columns) - 1),
+                    value=2,
+                    help="Number of latent dimensions to estimate jointly with choice model"
+                )
         
         # Hierarchical clustering option
         st.markdown("---")
@@ -1556,7 +1826,14 @@ def main():
         elif model_type == "Multiple Correspondence Analysis (MCA)":
             model_params = {'n_components': n_components}
         elif model_type == "Discrete Choice Model (PyMC)":
-            model_params = {'n_samples': n_samples, 'n_tune': n_tune, 'random_effects': include_random_effects}
+            model_params = {
+                'n_samples': n_samples, 
+                'n_tune': n_tune, 
+                'random_effects': include_random_effects,
+                'latent_mode': dcm_latent_mode,
+                'n_latent_factors': n_latent_factors if use_joint_estimation else 0,
+                'interactions': include_interactions if use_latent_features else False
+            }
         
         # Check if we need to invalidate the cache
         current_cache_key = get_model_cache_key(data_hash, model_type, model_params, tuple(product_columns))
@@ -1684,6 +1961,10 @@ def main():
                 st.session_state.var_explained_cached = fa_result['var_explained_pct']
                 st.session_state.cluster_result = None
                 
+                # Save latent features for potential use in DCM
+                st.session_state.latent_product_features = fa_result['loadings']
+                st.session_state.latent_feature_source = "Factor Analysis (Tetrachoric)"
+                
                 st.success(f"Factor analysis converged in {fa_result['n_iter']} iterations")
                 
                 st.subheader("Factor Loadings (Varimax Rotated)")
@@ -1721,6 +2002,10 @@ def main():
                 st.session_state.household_embeddings = bfa_result['scores']
                 st.session_state.var_explained_cached = bfa_result['var_explained_pct']
                 st.session_state.cluster_result = None
+                
+                # Save latent features for potential use in DCM
+                st.session_state.latent_product_features = bfa_result['loadings']
+                st.session_state.latent_feature_source = "Bayesian Factor Model (VI)"
                 
                 st.success(f"Model converged in {bfa_result['n_iter']} iterations")
                 
@@ -1762,6 +2047,10 @@ def main():
                 st.session_state.household_embeddings = factor_scores
                 st.session_state.var_explained_cached = bfa_result['var_explained_pct']
                 st.session_state.cluster_result = None
+                
+                # Save latent features for potential use in DCM
+                st.session_state.latent_product_features = bfa_result['loadings']
+                st.session_state.latent_feature_source = "Bayesian Factor Model (PyMC)"
                 
                 st.success("MCMC sampling complete!")
                 
@@ -1807,6 +2096,10 @@ def main():
                 st.session_state.var_explained_cached = nmf_result['var_explained_pct']
                 st.session_state.cluster_result = None
                 
+                # Save latent features for potential use in DCM
+                st.session_state.latent_product_features = nmf_result['loadings']
+                st.session_state.latent_feature_source = "Non-negative Matrix Factorization (NMF)"
+                
                 st.success(f"NMF converged in {nmf_result['n_iter']} iterations")
                 
                 st.subheader("Convergence")
@@ -1851,47 +2144,113 @@ def main():
                 st.session_state.var_explained_cached = mca_result['var_explained_pct']
                 st.session_state.cluster_result = None
                 
+                # Save latent features for potential use in DCM
+                st.session_state.latent_product_features = mca_result['column_coordinates']
+                st.session_state.latent_feature_source = "Multiple Correspondence Analysis (MCA)"
+                
                 st.success("MCA complete!")
             
             # =========== DISCRETE CHOICE MODEL (PyMC) ===========
             elif model_type == "Discrete Choice Model (PyMC)":
                 st.header("📊 Discrete Choice Model (PyMC)")
                 
-                st.info("""
-                **Model uses non-centered parameterization** for hierarchical effects to reduce divergences.
-                Features are standardized automatically.
-                """)
-                
                 # Prepare household features
                 hh_features = None
                 if household_feature_columns:
                     hh_features = df.loc[data_subset.index, household_feature_columns].values
-                    # Handle any missing values in features
                     hh_features = np.nan_to_num(hh_features, nan=0)
                 
-                # Prepare product features
+                # Prepare product features (from uploaded file)
                 prod_features = None
                 if product_feature_df is not None and use_product_features:
-                    # Get numeric columns only (exclude 'product' column)
                     prod_feature_cols = [c for c in product_feature_df.columns if c != 'product']
                     prod_features = product_feature_df[prod_feature_cols].values.astype(float)
                 
-                with st.spinner("Running MCMC sampling for discrete choice model..."):
-                    dcm_result = fit_discrete_choice_model_pymc(
-                        X,
-                        household_features=hh_features,
-                        product_features=prod_features,
-                        product_names=product_columns,
-                        include_random_effects=include_random_effects,
-                        n_samples=n_samples,
-                        n_tune=n_tune
-                    )
+                # ============ JOINT LATENT FACTOR DCM ============
+                if use_joint_estimation:
+                    st.info(f"""
+                    **Joint Latent Factor DCM** estimates:
+                    - **Λ (Lambda)**: {n_latent_factors}-dimensional latent product embeddings
+                    - **θ (theta)**: Household preferences over latent dimensions
+                    - **α (alpha)**: Product intercepts
+                    - Utility = α + θ @ Λ' + household effects
+                    """)
+                    
+                    with st.spinner(f"Running joint latent factor DCM with {n_latent_factors} factors..."):
+                        dcm_result = fit_latent_factor_dcm_pymc(
+                            X,
+                            n_factors=n_latent_factors,
+                            household_features=hh_features,
+                            include_random_effects=include_random_effects,
+                            n_samples=n_samples,
+                            n_tune=n_tune
+                        )
+                    
+                    # Product embeddings are the estimated Lambda
+                    product_embeds = dcm_result['Lambda']
+                    household_embeds = dcm_result['theta']
+                    var_explained = dcm_result['var_explained_pct']
+                    
+                    st.success("Joint estimation complete!")
+                    
+                    # Store latent features for future use
+                    st.session_state.latent_product_features = dcm_result['Lambda']
+                    st.session_state.latent_feature_source = f"Joint DCM ({n_latent_factors} factors)"
                 
-                # For DCM, we use alpha (intercepts) and beta (if available) as embeddings
-                # Create product embeddings from coefficients
-                product_embeds = dcm_result['alpha'].reshape(-1, 1)
-                if 'beta' in dcm_result:
-                    product_embeds = np.hstack([product_embeds, dcm_result['beta']])
+                # ============ TWO-STAGE WITH LATENT FEATURES ============
+                elif use_latent_features and st.session_state.latent_product_features is not None:
+                    latent_features = st.session_state.latent_product_features
+                    
+                    st.info(f"""
+                    **Two-Stage DCM** using latent features from: {st.session_state.latent_feature_source}
+                    - **γ (gamma)**: Effect of each latent dimension on utility
+                    - **α (alpha)**: Product intercepts
+                    {"- **δ (delta)**: Household × latent dimension interactions" if include_interactions else ""}
+                    """)
+                    
+                    with st.spinner("Running DCM with latent product features..."):
+                        dcm_result = fit_dcm_with_latent_features(
+                            X,
+                            latent_product_features=latent_features,
+                            household_features=hh_features,
+                            include_random_effects=include_random_effects,
+                            include_interactions=include_interactions,
+                            n_samples=n_samples,
+                            n_tune=n_tune
+                        )
+                    
+                    product_embeds = latent_features
+                    household_embeds = None
+                    var_explained = None
+                    
+                    st.success("Two-stage DCM complete!")
+                
+                # ============ STANDARD DCM ============
+                else:
+                    st.info("""
+                    **Standard DCM** with product intercepts and optional features.
+                    Features are standardized automatically.
+                    """)
+                    
+                    with st.spinner("Running MCMC sampling for discrete choice model..."):
+                        dcm_result = fit_discrete_choice_model_pymc(
+                            X,
+                            household_features=hh_features,
+                            product_features=prod_features,
+                            product_names=product_columns,
+                            include_random_effects=include_random_effects,
+                            n_samples=n_samples,
+                            n_tune=n_tune
+                        )
+                    
+                    # For standard DCM, create simple embeddings from coefficients
+                    product_embeds = dcm_result['alpha'].reshape(-1, 1)
+                    if 'beta' in dcm_result:
+                        product_embeds = np.hstack([product_embeds, dcm_result['beta']])
+                    household_embeds = None
+                    var_explained = None
+                    
+                    st.success("MCMC sampling complete!")
                 
                 # Compute similarity from raw data correlation
                 similarity_matrix = np.corrcoef(X.T)
@@ -1903,11 +2262,11 @@ def main():
                 st.session_state.product_columns_cached = product_columns
                 st.session_state.similarity_matrix_cached = similarity_matrix
                 st.session_state.product_embeddings = product_embeds
-                st.session_state.household_embeddings = None  # DCM doesn't have household embeddings
-                st.session_state.var_explained_cached = None
+                st.session_state.household_embeddings = household_embeds
+                st.session_state.var_explained_cached = var_explained
                 st.session_state.cluster_result = None
                 
-                st.success("MCMC sampling complete!")
+                # ============ DISPLAY RESULTS ============
                 
                 # Model diagnostics
                 col1, col2 = st.columns(2)
@@ -1932,37 +2291,110 @@ def main():
                 fig = plot_product_intercepts(dcm_result['alpha'], dcm_result['alpha_std'], product_columns)
                 st.plotly_chart(fig, use_container_width=True)
                 
-                # Household feature effects
-                if 'beta' in dcm_result:
-                    st.subheader("Household Feature Effects")
-                    fig = plot_beta_coefficients(dcm_result['beta'], dcm_result['beta_std'],
-                                                 product_columns, household_feature_columns)
+                # ============ JOINT MODEL SPECIFIC OUTPUTS ============
+                if use_joint_estimation:
+                    st.subheader("Estimated Latent Product Factors (Λ)")
+                    st.caption("Product positions in the estimated latent space")
+                    
+                    factor_labels = [f"Factor {k+1}" for k in range(n_latent_factors)]
+                    fig = plot_loadings_heatmap(
+                        dcm_result['Lambda'], 
+                        product_columns,
+                        factor_labels,
+                        "Product Loadings on Latent Factors"
+                    )
                     st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Variance explained by latent factors
+                    if 'var_explained_pct' in dcm_result:
+                        fig = plot_variance_explained(dcm_result['var_explained_pct'], "Joint DCM Latent Factors")
+                        st.plotly_chart(fig, use_container_width=True)
                 
-                # Product feature effects
-                if 'gamma' in dcm_result:
-                    st.subheader("Product Feature Effects")
-                    prod_feature_cols = [c for c in product_feature_df.columns if c != 'product']
+                # ============ TWO-STAGE SPECIFIC OUTPUTS ============
+                elif use_latent_features:
+                    st.subheader("Latent Dimension Effects (γ)")
+                    st.caption(f"How each latent dimension from {st.session_state.latent_feature_source} affects utility")
+                    
+                    n_latent = dcm_result['n_latent']
                     gamma_df = pd.DataFrame({
-                        'Feature': prod_feature_cols,
+                        'Latent Dimension': [f"Dim {i+1}" for i in range(n_latent)],
                         'Coefficient': dcm_result['gamma'],
                         'Std': dcm_result['gamma_std']
                     })
                     
                     fig = go.Figure()
                     fig.add_trace(go.Bar(
-                        x=gamma_df['Feature'],
+                        x=gamma_df['Latent Dimension'],
                         y=gamma_df['Coefficient'],
                         error_y=dict(type='data', array=gamma_df['Std'], visible=True),
-                        marker_color='coral'
+                        marker_color='purple'
                     ))
+                    fig.add_hline(y=0, line_dash="dash", line_color="gray")
                     fig.update_layout(
-                        title='Product Feature Effects (shared across households)',
-                        xaxis_title='Product Feature',
-                        yaxis_title='Coefficient',
+                        title='Effect of Latent Dimensions on Purchase Utility',
+                        xaxis_title='Latent Dimension',
+                        yaxis_title='Coefficient (γ)',
                         height=400
                     )
                     st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Interactions if estimated
+                    if include_interactions and 'delta' in dcm_result:
+                        st.subheader("Household × Latent Dimension Interactions (δ)")
+                        st.caption("How household features moderate preferences for latent dimensions")
+                        
+                        fig = go.Figure(data=go.Heatmap(
+                            z=dcm_result['delta'],
+                            x=household_feature_columns,
+                            y=[f"Dim {i+1}" for i in range(n_latent)],
+                            colorscale='RdBu_r',
+                            zmid=0,
+                            text=np.round(dcm_result['delta'], 2),
+                            texttemplate='%{text}',
+                            hovertemplate='%{y} × %{x}<br>δ: %{z:.3f}<extra></extra>'
+                        ))
+                        fig.update_layout(
+                            title='Interaction Effects: Latent Dimensions × Household Features',
+                            xaxis_title='Household Feature',
+                            yaxis_title='Latent Dimension',
+                            height=400
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                
+                # ============ COMMON OUTPUTS ============
+                
+                # Household feature effects
+                if 'beta' in dcm_result and household_feature_columns:
+                    st.subheader("Household Feature Effects (β)")
+                    fig = plot_beta_coefficients(dcm_result['beta'], dcm_result['beta_std'],
+                                                 product_columns, household_feature_columns)
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                # Product feature effects (only for standard DCM with uploaded features)
+                if 'gamma' in dcm_result and not use_latent_features and not use_joint_estimation:
+                    if product_feature_df is not None:
+                        st.subheader("Product Feature Effects")
+                        prod_feature_cols = [c for c in product_feature_df.columns if c != 'product']
+                        gamma_df = pd.DataFrame({
+                            'Feature': prod_feature_cols,
+                            'Coefficient': dcm_result['gamma'],
+                            'Std': dcm_result['gamma_std']
+                        })
+                        
+                        fig = go.Figure()
+                        fig.add_trace(go.Bar(
+                            x=gamma_df['Feature'],
+                            y=gamma_df['Coefficient'],
+                            error_y=dict(type='data', array=gamma_df['Std'], visible=True),
+                            marker_color='coral'
+                        ))
+                        fig.update_layout(
+                            title='Product Feature Effects (shared across households)',
+                            xaxis_title='Product Feature',
+                            yaxis_title='Coefficient',
+                            height=400
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
                 
                 # Random effects
                 if include_random_effects and 'sigma_hh' in dcm_result:
@@ -2241,6 +2673,30 @@ def main():
             | **Bayesian FA (PyMC)** | Full uncertainty | Posteriors + credible intervals |
             | **Discrete Choice (PyMC)** | Understanding drivers | Feature coefficients |
             
+            ### Discrete Choice Model with Latent Features
+            
+            The DCM now supports three modes for incorporating latent product structure:
+            
+            **1. Standard DCM (None)**
+            - Product intercepts (α): baseline purchase probability for each product
+            - Household features (β): how demographics affect purchase of each product
+            - No latent structure assumed
+            
+            **2. Two-Stage Approach**
+            - First fit a factor model (FA, MCA, NMF) to discover product embeddings
+            - Then use those embeddings as features in DCM
+            - **γ (gamma)**: Effect of each latent dimension on utility
+            - **δ (delta)**: Optional interactions between household features and latent dimensions
+            - Advantage: Interpretable latent features from dedicated model
+            - Limitation: Uncertainty from first stage not propagated
+            
+            **3. Joint Estimation**
+            - Simultaneously estimate latent factors and choice parameters
+            - **Λ (Lambda)**: Product positions in latent space (like factor loadings)
+            - **θ (theta)**: Household preferences over latent dimensions
+            - Advantage: Fully Bayesian, accounts for all uncertainty
+            - Limitation: More complex, slower to fit
+            
             ### Biplot Interpretation
             
             - **Product positions**: Products close together have similar purchase patterns
@@ -2261,6 +2717,13 @@ def main():
             - **Dimensions**: Each dimension captures a "shopping style" or product affinity pattern.
             - **Contributions**: Shows which products define each dimension most strongly.
             - **Inertia**: MCA's analog to variance explained. Total inertia = (n_categories/n_variables) - 1 for binary data.
+            
+            ### Workflow Recommendation
+            
+            1. **Start with exploratory models**: Run MCA or FA to understand latent structure
+            2. **Cluster products**: Use the embedding space to find natural groupings
+            3. **Build DCM**: Use two-stage or joint estimation to model purchase drivers
+            4. **Iterate**: Compare models using WAIC to find the best specification
             
             ### General Tips
             
