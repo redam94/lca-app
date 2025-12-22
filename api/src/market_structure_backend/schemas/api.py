@@ -233,8 +233,26 @@ class ModelResultsResponse(BaseModel):
     # Similarity/correlation matrix
     similarity_matrix: Optional[list[list[float]]] = None
     
-    # Variance explained
-    var_explained_pct: Optional[list[float]] = None
+    # Variance explained - NOTE: renamed from var_explained_pct to match frontend
+    variance_explained: Optional[list[float]] = None
+    
+    # ==========================================
+    # NEW FIELDS - Added to match frontend types
+    # ==========================================
+    
+    # Factor loadings (for factor-type models)
+    loadings: Optional[list[list[float]]] = None
+    loadings_std: Optional[list[list[float]]] = None
+    
+    # LCA-specific fields
+    item_probs: Optional[list[list[float]]] = None  # (n_classes, n_items)
+    class_probs: Optional[list[float]] = None  # (n_classes,)
+    
+    # DCM-specific fields
+    alpha: Optional[list[float]] = None  # Product intercepts
+    alpha_std: Optional[list[float]] = None  # Intercept std errors
+    product_latent: Optional[list[list[float]]] = None  # Latent product features
+    household_latent: Optional[list[list[float]]] = None  # Latent household preferences
     
     # Product labels
     product_columns: list[str]

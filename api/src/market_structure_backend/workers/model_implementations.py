@@ -118,7 +118,7 @@ async def fit_bayesian_vi_with_progress(
     data: np.ndarray,
     n_factors: int,
     max_iter: int = 1000,
-    learning_rate: float = 0.01,
+    tol: float = 1e-4,  # ← Change to tol
     progress_callback: Optional[Callable] = None,
 ) -> dict:
     """
@@ -132,7 +132,7 @@ async def fit_bayesian_vi_with_progress(
             data,
             n_factors=n_factors,
             max_iter=max_iter,
-            learning_rate=learning_rate,
+            tol=tol,  # ← Pass tol instead
         )
         
         if progress_callback:
