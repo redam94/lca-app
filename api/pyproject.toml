@@ -1,0 +1,63 @@
+[project]
+name = "market-structure-backend"
+version = "0.1.0"
+description = "FastAPI backend with ARQ workers for market structure analysis"
+authors = [
+    { name = "Matthew Reda", email = "m.reda94@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    # Web framework
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "python-multipart>=0.0.18",
+    # Background jobs
+    "arq>=0.26.0",
+    "redis>=5.2.0",
+    # Database
+    "sqlalchemy>=2.0.0",
+    "alembic>=1.14.0",
+    "aiosqlite>=0.20.0",
+    # Serialization
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.6.0",
+    "orjson>=3.10.0",
+    # Analysis dependencies
+    "numpy>=2.0.0",
+    "pandas>=2.2.0",
+    "scipy>=1.14.0",
+    "scikit-learn>=1.6.0",
+    "pymc>=5.26.1",
+    "arviz>=0.20.0",
+    "numba>=0.61.0",
+    "greenlet>=3.3.0",
+    "market-structure",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "httpx>=0.28.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/market_structure_backend"]
+
+[tool.uv.sources]
+market-structure-backend = { workspace = true }
+market-structure = { path = "../lca_analysis" }
+
+[dependency-groups]
+dev = [
+    "market-structure-backend",
+]
+
+[project.scripts]
+# CLI entry points
+backend-api = "market_structure_backend.main:run_api"
+backend-worker = "market_structure_backend.workers.runner:run_worker"

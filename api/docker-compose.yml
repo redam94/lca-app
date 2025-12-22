@@ -1,0 +1,66 @@
+services:
+  # Redis for job queue and pub/sub
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # FastAPI server
+  api:
+    build:
+      context: ..  # Parent directory containing both lca_analysis and api
+      dockerfile: api/Dockerfile  # Path to Dockerfile relative to context
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - DATABASE_URL=sqlite+aiosqlite:///./data/model_runs.db
+      - API_DEBUG=false
+      - API_WORKERS=2
+    volumes:
+      - ./data:/app/data
+      - ./model_results:/app/model_results
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: backend-api
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # ARQ workers (scale as needed)
+  worker:
+    build:
+      context: ..  # Parent directory containing both lca_analysis and api
+      dockerfile: api/Dockerfile  # Path to Dockerfile relative to context
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - DATABASE_URL=sqlite+aiosqlite:///./data/model_runs.db
+      - WORKER_CONCURRENCY=4
+    volumes:
+      - ./data:/app/data
+      - ./model_results:/app/model_results
+    depends_on:
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    command: backend-worker
+    deploy:
+      replicas: 2  # Run 2 worker instances
+
+volumes:
+  redis_data:
