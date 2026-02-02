@@ -4,9 +4,14 @@ Model implementations with progress callback support.
 These functions wrap the model fitting functions from the lca_analysis package
 and integrate with the progress tracking system. They run in a thread pool
 to avoid blocking the async event loop.
+
+IMPORTANT: Garbage collection is performed before entering the thread pool
+to prevent aiosqlite connections from being garbage collected in worker
+threads that don't have an event loop.
 """
 
 import asyncio
+import gc
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Callable, Any
 
@@ -29,11 +34,23 @@ if PYMC_AVAILABLE:
 
 
 # Thread pool for running CPU-bound model fitting
-_executor = ThreadPoolExecutor(max_workers=4)
+# Use fewer workers to reduce memory pressure with PyMC
+_executor = ThreadPoolExecutor(max_workers=2)
 
 
 async def _run_in_executor(func, *args, **kwargs):
-    """Run a sync function in the thread pool."""
+    """
+    Run a sync function in the thread pool.
+    
+    Performs garbage collection before entering the executor to ensure
+    any lingering async connections (like aiosqlite) are properly cleaned
+    up while still in the main event loop context.
+    """
+    # CRITICAL: Force garbage collection before entering ThreadPoolExecutor
+    # This prevents aiosqlite connections from being GC'd in worker threads
+    # where there's no event loop, which causes RuntimeError
+    gc.collect()
+    
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(
         _executor,
@@ -118,7 +135,7 @@ async def fit_bayesian_vi_with_progress(
     data: np.ndarray,
     n_factors: int,
     max_iter: int = 1000,
-    tol: float = 1e-4,  # ← Change to tol
+    learning_rate: float = 0.01,
     progress_callback: Optional[Callable] = None,
 ) -> dict:
     """
@@ -132,7 +149,7 @@ async def fit_bayesian_vi_with_progress(
             data,
             n_factors=n_factors,
             max_iter=max_iter,
-            tol=tol,  # ← Pass tol instead
+            learning_rate=learning_rate,
         )
         
         if progress_callback:

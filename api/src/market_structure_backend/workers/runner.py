@@ -3,6 +3,11 @@ ARQ worker runner and configuration.
 
 This module configures and runs the ARQ worker process that
 executes model fitting tasks in the background.
+
+Key design: Database and Redis connections are initialized ONCE at worker
+startup and stored in the context dict. This prevents issues with aiosqlite
+connections being garbage collected in PyMC's ThreadPoolExecutor threads
+where there's no event loop.
 """
 
 import asyncio
@@ -13,16 +18,8 @@ from arq import create_pool
 from arq.connections import RedisSettings
 
 from ..core.config import get_settings
-from ..db import init_db
-from .tasks import (
-    fit_lca_task,
-    fit_bayesian_factor_pymc_task,
-    fit_dcm_task,
-    fit_factor_tetrachoric_task,
-    fit_nmf_task,
-    fit_mca_task,
-    fit_bayesian_vi_task,
-)
+from ..db import init_db, get_session_factory
+from ..progress import ProgressTracker
 
 
 # Configure logging
@@ -37,20 +34,28 @@ async def startup(ctx: dict):
     """
     Called when the worker starts.
     
-    Initialize database connection and any other resources.
+    Initialize database connection and other resources ONCE.
+    These are stored in ctx and reused by all tasks.
     """
     settings = get_settings()
     
     logger.info("Worker starting up...")
     
-    # Initialize database
+    # Initialize database ONCE at startup
     await init_db(settings.database_url)
     logger.info(f"Database initialized: {settings.database_url}")
+    
+    # Store session factory in context for all tasks to use
+    ctx['session_factory'] = get_session_factory()
     
     # Store settings in context for tasks
     ctx['settings'] = settings
     
-    logger.info("Worker startup complete")
+    # Pre-create a ProgressTracker that can be reused
+    # (Each task will still create its own for isolation, but settings are cached)
+    ctx['redis_url'] = settings.redis_url
+    
+    logger.info("Worker startup complete - resources stored in context")
 
 
 async def shutdown(ctx: dict):
@@ -60,17 +65,22 @@ async def shutdown(ctx: dict):
     Clean up resources.
     """
     logger.info("Worker shutting down...")
-    # Add any cleanup logic here
+    
+    # Clean up any resources if needed
+    # The database engine will be garbage collected
+    # Redis connections are closed per-task
+    
+    logger.info("Worker shutdown complete")
 
 
 async def on_job_start(ctx: dict):
     """Called when a job starts."""
-    logger.info(f"Job starting")
+    logger.info("Job starting")
 
 
 async def on_job_end(ctx: dict):
     """Called when a job ends."""
-    logger.info(f"Job completed")
+    logger.info("Job completed")
 
 
 class WorkerSettings:
@@ -87,6 +97,17 @@ class WorkerSettings:
         port=settings.redis_port,
         database=settings.redis_db,
         password=settings.redis_password,
+    )
+    
+    # Import tasks here to avoid circular imports
+    from .tasks import (
+        fit_lca_task,
+        fit_bayesian_factor_pymc_task,
+        fit_dcm_task,
+        fit_factor_tetrachoric_task,
+        fit_nmf_task,
+        fit_mca_task,
+        fit_bayesian_vi_task,
     )
     
     # Task functions to register
@@ -107,7 +128,8 @@ class WorkerSettings:
     on_job_end = on_job_end
     
     # Worker configuration
-    max_jobs = 4  # Concurrent jobs per worker
+    # Reduce concurrent jobs for memory-intensive PyMC tasks
+    max_jobs = 2  # Reduced from 4 to prevent OOM with PyMC
     job_timeout = 3600  # 1 hour max per job
     keep_result = 86400  # Keep results for 24 hours
     

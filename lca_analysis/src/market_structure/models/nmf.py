@@ -25,7 +25,7 @@ from sklearn.decomposition import NMF
 from typing import Dict
 
 
-def fit_nmf(data: np.ndarray, n_components: int, 
+def fit_nmf(data: np.ndarray, n_components: int, init: str = 'nndsvda',
             max_iter: int = 200, random_state: int = 42) -> Dict:
     """
     Fit Non-negative Matrix Factorization model.
@@ -55,12 +55,12 @@ def fit_nmf(data: np.ndarray, n_components: int,
         - n_iter: Number of iterations until convergence
     """
     # Initialize and fit NMF model
-    # Using 'nndsvd' initialization which is deterministic and often works well
+    # Using 'nndsvda' initialization which is deterministic and often works well
     model = NMF(
         n_components=n_components, 
         max_iter=max_iter, 
         random_state=random_state,
-        init='nndsvda',  # NNDSVD with zeros replaced by small values
+        init=init,  # NNDSVD with zeros replaced by small values
         solver='cd',     # Coordinate descent is fast for sparse-ish data
         beta_loss='frobenius'  # Standard squared error loss
     )

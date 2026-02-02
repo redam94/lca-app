@@ -42,7 +42,11 @@ def fit_discrete_choice_model(purchase_data: np.ndarray,
                                n_tune: int = 500,
                                include_random_effects: bool = False,
                                n_latent_features: int = 0,
-                               latent_prior_scale: float = 1.0) -> Dict:
+                               latent_prior_scale: float = 1.0,
+                               n_chains: int = 4,
+                               target_accept: float = 0.9,
+                               callback: Optional[callable] = None
+                               ) -> Dict:
     """
     Fit Discrete Choice Model using PyMC with MCMC sampling.
     
@@ -165,12 +169,14 @@ def fit_discrete_choice_model(purchase_data: np.ndarray,
         # Sample using nutpie
         trace = pm.sample(
             n_samples, 
-            tune=n_tune, 
+            tune=n_tune,
+            n_chains=n_chains, 
             nuts_sampler='nutpie',
             progressbar=True,
             return_inferencedata=True,
-            target_accept=0.9,
-            random_seed=42
+            target_accept=target_accept,
+            random_seed=42,
+            callback = callback
         )
         
         # Compute log-likelihood for model comparison

@@ -5,8 +5,13 @@ Each model type has a corresponding task function that:
 1. Updates database status to RUNNING
 2. Executes the model fit with progress callbacks
 3. Stores results and updates status to COMPLETED or FAILED
+
+Key design: Database session_factory is obtained from the worker context (ctx)
+which is initialized once at worker startup. This prevents issues with aiosqlite
+connections being garbage collected in PyMC's ThreadPoolExecutor threads.
 """
 
+import gc
 import json
 import traceback
 import pickle
@@ -18,13 +23,35 @@ import numpy as np
 from arq import ArqRedis
 
 from ..core.config import get_settings
-from ..db import ModelRun, ModelRunStatus, ModelType, init_db, get_session_factory
+from ..db import ModelRun, ModelRunStatus, ModelType, get_session_factory
 from ..progress import ProgressTracker, PyMCSamplingCallback, EMProgressCallback, ProgressUpdate
 
 
 # Results storage directory
 RESULTS_DIR = Path("./model_results")
 RESULTS_DIR.mkdir(exist_ok=True)
+
+
+def _get_session_factory(ctx: dict):
+    """
+    Get session factory from context or fall back to global.
+    
+    The session factory should be in ctx from worker startup,
+    but we provide a fallback for safety.
+    """
+    if 'session_factory' in ctx:
+        return ctx['session_factory']
+    # Fallback - shouldn't happen if worker started correctly
+    return get_session_factory()
+
+
+def _get_settings(ctx: dict):
+    """
+    Get settings from context or fall back to global.
+    """
+    if 'settings' in ctx:
+        return ctx['settings']
+    return get_settings()
 
 
 async def _update_run_status(
@@ -137,15 +164,15 @@ async def fit_lca_task(
     ARQ task for fitting Latent Class Analysis.
     
     Args:
-        ctx: ARQ context with Redis connection
+        ctx: ARQ context with session_factory and settings from worker startup
         run_id: Model run ID
         data: Purchase data matrix (n_households x n_products)
         params: LCA parameters (n_classes, max_iter, n_init)
         product_columns: Product column names
     """
-    settings = get_settings()
-    await init_db(settings.database_url)
-    session_factory = get_session_factory()
+    # Get resources from context (initialized at worker startup)
+    settings = _get_settings(ctx)
+    session_factory = _get_session_factory(ctx)
     
     tracker = await ProgressTracker.create(settings.redis_url)
     
@@ -161,7 +188,6 @@ async def fit_lca_task(
         X = np.array(data)
         
         # Import the model fitting function
-        # Note: In production, you'd import from the market_structure package
         from .model_implementations import fit_lca_with_progress
         
         # Create progress callback
@@ -170,6 +196,9 @@ async def fit_lca_task(
             tracker=tracker,
             max_iter=params.get("max_iter", 100),
         )
+        
+        # Force garbage collection before executor to clean up any lingering connections
+        gc.collect()
         
         # Fit the model
         result = await fit_lca_with_progress(
@@ -243,10 +272,14 @@ async def fit_bayesian_factor_pymc_task(
     ARQ task for fitting Bayesian Factor Model with PyMC MCMC.
     
     This task demonstrates full PyMC progress tracking via callbacks.
+    
+    Note: PyMC runs in a ThreadPoolExecutor. To avoid aiosqlite event loop
+    issues, we get the session_factory from context (initialized at startup)
+    and force garbage collection before entering the executor.
     """
-    settings = get_settings()
-    await init_db(settings.database_url)
-    session_factory = get_session_factory()
+    # Get resources from context (initialized at worker startup)
+    settings = _get_settings(ctx)
+    session_factory = _get_session_factory(ctx)
     
     tracker = await ProgressTracker.create(settings.redis_url)
     
@@ -273,6 +306,10 @@ async def fit_bayesian_factor_pymc_task(
             n_tune=n_tune,
             n_chains=n_chains,
         )
+        
+        # CRITICAL: Force garbage collection before entering ThreadPoolExecutor
+        # This prevents aiosqlite connections from being GC'd in worker threads
+        gc.collect()
         
         # Fit the model
         result = await fit_bayesian_factor_pymc_with_progress(
@@ -347,9 +384,9 @@ async def fit_dcm_task(
     household_features: Optional[list[list[float]]] = None,
 ):
     """ARQ task for fitting Discrete Choice Model."""
-    settings = get_settings()
-    await init_db(settings.database_url)
-    session_factory = get_session_factory()
+    # Get resources from context
+    settings = _get_settings(ctx)
+    session_factory = _get_session_factory(ctx)
     
     tracker = await ProgressTracker.create(settings.redis_url)
     
@@ -376,6 +413,9 @@ async def fit_dcm_task(
             n_tune=n_tune,
             n_chains=n_chains,
         )
+        
+        # Force garbage collection before entering ThreadPoolExecutor
+        gc.collect()
         
         result = await fit_dcm_with_progress(
             X,
@@ -445,9 +485,10 @@ async def fit_factor_tetrachoric_task(
     product_columns: list[str],
 ):
     """ARQ task for Tetrachoric Factor Analysis."""
-    settings = get_settings()
-    await init_db(settings.database_url)
-    session_factory = get_session_factory()
+    # Get resources from context
+    settings = _get_settings(ctx)
+    session_factory = _get_session_factory(ctx)
+    
     tracker = await ProgressTracker.create(settings.redis_url)
     
     try:
@@ -466,6 +507,8 @@ async def fit_factor_tetrachoric_task(
             tracker=tracker,
             max_iter=params.get("max_iter", 100),
         )
+        
+        gc.collect()
         
         result = await fit_factor_tetrachoric_with_progress(
             X,
@@ -512,9 +555,10 @@ async def fit_nmf_task(
     product_columns: list[str],
 ):
     """ARQ task for Non-negative Matrix Factorization."""
-    settings = get_settings()
-    await init_db(settings.database_url)
-    session_factory = get_session_factory()
+    # Get resources from context
+    settings = _get_settings(ctx)
+    session_factory = _get_session_factory(ctx)
+    
     tracker = await ProgressTracker.create(settings.redis_url)
     
     try:
@@ -533,6 +577,8 @@ async def fit_nmf_task(
             tracker=tracker,
             max_iter=params.get("max_iter", 200),
         )
+        
+        gc.collect()
         
         result = await fit_nmf_with_progress(
             X,
@@ -583,9 +629,10 @@ async def fit_bayesian_vi_task(
     product_columns: list[str],
 ):
     """ARQ task for Bayesian Factor Model with Variational Inference."""
-    settings = get_settings()
-    await init_db(settings.database_url)
-    session_factory = get_session_factory()
+    # Get resources from context
+    settings = _get_settings(ctx)
+    session_factory = _get_session_factory(ctx)
+    
     tracker = await ProgressTracker.create(settings.redis_url)
     
     try:
@@ -604,6 +651,8 @@ async def fit_bayesian_vi_task(
             tracker=tracker,
             max_iter=params.get("max_iter", 100),
         )
+        
+        gc.collect()
         
         result = await fit_bayesian_vi_with_progress(
             X,
@@ -650,9 +699,10 @@ async def fit_mca_task(
     product_columns: list[str],
 ):
     """ARQ task for Multiple Correspondence Analysis."""
-    settings = get_settings()
-    await init_db(settings.database_url)
-    session_factory = get_session_factory()
+    # Get resources from context
+    settings = _get_settings(ctx)
+    session_factory = _get_session_factory(ctx)
+    
     tracker = await ProgressTracker.create(settings.redis_url)
     
     try:
@@ -671,6 +721,8 @@ async def fit_mca_task(
             tracker=tracker,
             max_iter=1,  # MCA is not iterative
         )
+        
+        gc.collect()
         
         result = await fit_mca_with_progress(
             X,

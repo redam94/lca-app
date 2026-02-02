@@ -21,14 +21,18 @@ Requires: pymc, pytensor, arviz
 """
 
 import numpy as np
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 from ..config import PYMC_AVAILABLE, pm, pt, az
 
 
 def fit_bayesian_factor_model_pymc(data: np.ndarray, n_factors: int,
                                     n_samples: int = 1000, 
-                                    n_tune: int = 500) -> Dict:
+                                    n_tune: int = 500,
+                                    n_chains: int = 4,
+                                    target_accept: float = 0.9,
+                                    callback: Optional[callable] = None
+                                    ) -> Dict:
     """
     Fit Bayesian Factor Model using PyMC with MCMC sampling.
     
@@ -135,12 +139,14 @@ def fit_bayesian_factor_model_pymc(data: np.ndarray, n_factors: int,
         # Sample using nutpie (fast NUTS implementation)
         trace = pm.sample(
             n_samples, 
-            tune=n_tune, 
+            tune=n_tune,
+            n_chains=n_chains,
             nuts_sampler='nutpie',
             progressbar=True, 
             return_inferencedata=True,
-            target_accept=0.95,  # Higher for constrained parameters
-            random_seed=42
+            target_accept=target_accept,  # Higher for constrained parameters
+            random_seed=42,
+            callback=callback
         )
         
         # Compute log-likelihood for WAIC
@@ -248,19 +254,20 @@ def _reconstruct_loadings_samples(trace, n_items: int, n_factors: int,
     diag_samples = trace.posterior['diag_loadings'].values
     n_chains, n_draws = diag_samples.shape[:2]
     n_total_samples = n_chains * n_draws
-    
+    n_total_samples_frac = int(n_total_samples/10)
+
     diag_samples = diag_samples.reshape(n_total_samples, n_factors)
     
     if n_lower > 0:
-        lower_samples = trace.posterior['lower_loadings'].values.reshape(n_total_samples, n_lower)
+        lower_samples = trace.posterior['lower_loadings'].values.reshape(n_total_samples, n_lower)[::10, :]
     
     if n_remaining > 0:
-        remaining_samples = trace.posterior['remaining_loadings'].values.reshape(n_total_samples, n_remaining)
+        remaining_samples = trace.posterior['remaining_loadings'].values.reshape(n_total_samples, n_remaining)[::10, :]
     
     # Reconstruct full loading matrix for each sample
-    loadings_samples = np.zeros((n_total_samples, n_items, n_factors))
+    loadings_samples = np.zeros((n_total_samples_frac, n_items, n_factors))
     
-    for s in range(n_total_samples):
+    for s in range(n_total_samples_frac):
         flat = np.zeros(n_items * n_factors)
         
         # Place diagonal elements
