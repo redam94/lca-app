@@ -14,3 +14,4 @@ model_results
 *.db
 *.sqlite
 *.sqlite3
+model_runs.db
