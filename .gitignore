@@ -11,3 +11,6 @@ wheels/
 *.csv
 data/
 model_results
+*.db
+*.sqlite
+*.sqlite3
