@@ -34,11 +34,17 @@ from .factor import (
 # NMF exports
 from .nmf import fit_nmf
 
+# LDA exports
+from .lda import fit_lda, get_top_products_per_topic, compute_topic_similarity
+
 # Conditional imports for optional dependencies
-from ..config import PYMC_AVAILABLE, PRINCE_AVAILABLE
+from ..config import PYMC_AVAILABLE, PRINCE_AVAILABLE, NETWORKX_AVAILABLE
 
 if PRINCE_AVAILABLE:
     from .mca import fit_mca
+
+if NETWORKX_AVAILABLE:
+    from .network import fit_network_analysis, get_community_members, get_top_central_products
 
 if PYMC_AVAILABLE:
     from .bayesian import fit_bayesian_factor_model_pymc
@@ -57,10 +63,17 @@ __all__ = [
     'fit_bayesian_factor_vi',
     'compute_factor_scores_regression',
     'fit_nmf',
+    # LDA (always available - uses sklearn)
+    'fit_lda',
+    'get_top_products_per_topic',
+    'compute_topic_similarity',
 ]
 
 if PRINCE_AVAILABLE:
     __all__.append('fit_mca')
+
+if NETWORKX_AVAILABLE:
+    __all__.extend(['fit_network_analysis', 'get_community_members', 'get_top_central_products'])
 
 if PYMC_AVAILABLE:
     __all__.extend(['fit_bayesian_factor_model_pymc', 'fit_discrete_choice_model'])

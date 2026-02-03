@@ -25,6 +25,8 @@ class ModelTypeEnum(str, Enum):
     NMF = "nmf"
     MCA = "mca"
     DCM = "dcm"
+    LDA = "lda"
+    NETWORK = "network"
 
 
 class ModelRunStatusEnum(str, Enum):
@@ -91,6 +93,20 @@ class DCMParams(BaseModel):
     household_feature_columns: Optional[list[str]] = Field(default=None, description="Household feature columns")
 
 
+class LDAParams(BaseModel):
+    """Parameters for Latent Dirichlet Allocation."""
+    n_topics: int = Field(ge=2, le=50, description="Number of topics to discover")
+    max_iter: int = Field(default=100, ge=10, le=500, description="Maximum iterations")
+    learning_method: str = Field(default="online", description="Learning method: 'online' or 'batch'")
+
+
+class NetworkAnalysisParams(BaseModel):
+    """Parameters for Network Analysis."""
+    threshold: float = Field(default=0.1, ge=0.0, le=1.0, description="Minimum edge weight threshold")
+    community_method: str = Field(default="louvain", description="Community detection method")
+    edge_method: str = Field(default="lift", description="Edge weight calculation method")
+
+
 # Union of all parameter types
 ModelParams = Union[
     LCAParams,
@@ -100,6 +116,8 @@ ModelParams = Union[
     NMFParams,
     MCAParams,
     DCMParams,
+    LDAParams,
+    NetworkAnalysisParams,
 ]
 
 
@@ -113,7 +131,10 @@ class DataUpload(BaseModel):
     csv_base64: Optional[str] = Field(default=None, description="Base64 encoded CSV data")
     data_json: Optional[list[list[float]]] = Field(default=None, description="Pre-parsed data matrix")
     column_names: Optional[list[str]] = Field(default=None, description="Column names")
-    
+    # Covariate data for LCA with covariates
+    covariates_json: Optional[list[list[float]]] = Field(default=None, description="Household covariate matrix")
+    covariate_column_names: Optional[list[str]] = Field(default=None, description="Covariate column names")
+
     model_config = ConfigDict(extra="forbid")
 
 
@@ -253,10 +274,36 @@ class ModelResultsResponse(BaseModel):
     alpha_std: Optional[list[float]] = None  # Intercept std errors
     product_latent: Optional[list[list[float]]] = None  # Latent product features
     household_latent: Optional[list[list[float]]] = None  # Latent household preferences
-    
+
+    # LCA with covariates fields
+    beta: Optional[list[list[float]]] = None  # Regression coefficients (n_features x n_classes)
+    odds_ratios: Optional[list[list[float]]] = None  # exp(beta) for interpretation
+    covariate_columns: Optional[list[str]] = None  # Covariate column names
+    class_probs_per_hh: Optional[list[list[float]]] = None  # Per-household class probs
+
+    # Additional model-specific fields
+    residual_correlations: Optional[list[list[float]]] = None  # For LCA models
+    tetra_corr: Optional[list[list[float]]] = None  # Tetrachoric correlation matrix
+    elbo_history: Optional[list[float]] = None  # For Bayesian VI models
+
+    # LDA-specific fields
+    topic_product_dist: Optional[list[list[float]]] = None  # (n_topics, n_products)
+    household_topic_dist: Optional[list[list[float]]] = None  # (n_households, n_topics)
+    perplexity: Optional[float] = None  # LDA perplexity score
+    n_topics: Optional[int] = None  # Number of topics
+
+    # Network Analysis-specific fields
+    adjacency_matrix: Optional[list[list[float]]] = None  # Product co-purchase matrix
+    communities: Optional[list[int]] = None  # Community assignments per product
+    centrality_scores: Optional[list[float]] = None  # Eigenvector centrality
+    degree_centrality: Optional[list[float]] = None  # Degree centrality
+    betweenness_centrality: Optional[list[float]] = None  # Betweenness centrality
+    graph_metrics: Optional[dict[str, Any]] = None  # Network statistics
+    n_communities: Optional[int] = None  # Number of detected communities
+
     # Product labels
     product_columns: list[str]
-    
+
     # Metrics
     metrics: Optional[dict[str, Any]] = None
 
@@ -270,8 +317,87 @@ class HealthResponse(BaseModel):
     workers_active: int
 
 
+# =============================================================================
+# WORKER STATUS SCHEMAS
+# =============================================================================
+
+class JobInfo(BaseModel):
+    """Information about a single ARQ job."""
+    job_id: str
+    function: str
+    status: str  # queued, in_progress, complete, not_found
+    enqueue_time: Optional[datetime] = None
+    start_time: Optional[datetime] = None
+    finish_time: Optional[datetime] = None
+    result: Optional[Any] = None
+    run_id: Optional[str] = None  # Associated model run ID
+
+
+class QueueStats(BaseModel):
+    """Statistics about the ARQ queue."""
+    queued_jobs: int
+    in_progress_jobs: int
+    completed_jobs: int  # Jobs with results still in Redis
+    total_keys: int
+
+
+class WorkerInfo(BaseModel):
+    """Information about an ARQ worker."""
+    worker_id: str
+    last_health_check: Optional[datetime] = None
+    jobs_completed: int = 0
+    jobs_failed: int = 0
+    current_job: Optional[str] = None
+
+
+class WorkerStatusResponse(BaseModel):
+    """Full worker status response."""
+    redis_connected: bool
+    queue_stats: Optional[QueueStats] = None
+    workers: list[WorkerInfo] = []
+    recent_jobs: list[JobInfo] = []
+    pending_runs: list[dict[str, Any]] = []  # Runs in pending/running status
+
+
 class ErrorResponse(BaseModel):
     """Error response schema."""
     error: str
     detail: Optional[str] = None
     model_run_id: Optional[str] = None
+
+
+# =============================================================================
+# CLUSTERING SCHEMAS
+# =============================================================================
+
+class ClusteringMethodEnum(str, Enum):
+    """Available clustering methods."""
+    KMEANS = "kmeans"
+    HIERARCHICAL = "hierarchical"
+
+
+class ClusteringRequest(BaseModel):
+    """Request to run clustering on model results."""
+    method: ClusteringMethodEnum = Field(default=ClusteringMethodEnum.KMEANS, description="Clustering method")
+    n_clusters: Optional[int] = Field(default=None, ge=2, le=20, description="Number of clusters (None = auto-detect)")
+    max_k: int = Field(default=10, ge=2, le=20, description="Maximum k for auto-detection")
+    linkage_method: str = Field(default="ward", description="Linkage method for hierarchical clustering")
+
+
+class ClusteringResponse(BaseModel):
+    """Response from clustering endpoint."""
+    model_run_id: str
+    method: ClusteringMethodEnum
+    n_clusters: int
+    labels: list[int]  # Cluster assignment for each product
+    product_columns: list[str]  # Product names
+    silhouette_score: Optional[float] = None
+    inertia: Optional[float] = None  # For k-means
+    # For hierarchical clustering
+    linkage_matrix: Optional[list[list[float]]] = None
+    # Auto-detection results
+    optimal_k: Optional[int] = None
+    silhouette_scores: Optional[list[float]] = None
+    k_range: Optional[list[int]] = None
+    # Cluster membership mapping
+    cluster_members: Optional[dict[str, list[str]]] = None  # cluster_id -> list of products

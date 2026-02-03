@@ -102,23 +102,29 @@ class WorkerSettings:
     # Import tasks here to avoid circular imports
     from .tasks import (
         fit_lca_task,
+        fit_lca_covariates_task,
         fit_bayesian_factor_pymc_task,
         fit_dcm_task,
         fit_factor_tetrachoric_task,
         fit_nmf_task,
         fit_mca_task,
         fit_bayesian_vi_task,
+        fit_lda_task,
+        fit_network_task,
     )
-    
+
     # Task functions to register
     functions = [
         fit_lca_task,
+        fit_lca_covariates_task,
         fit_bayesian_factor_pymc_task,
         fit_dcm_task,
         fit_factor_tetrachoric_task,
         fit_nmf_task,
         fit_mca_task,
         fit_bayesian_vi_task,
+        fit_lda_task,
+        fit_network_task,
     ]
     
     # Lifecycle hooks

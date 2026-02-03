@@ -45,31 +45,54 @@ router = APIRouter(prefix="/runs", tags=["Model Runs"])
 # HELPER FUNCTIONS
 # =============================================================================
 
-def _parse_data(request: ModelRunRequest) -> tuple[np.ndarray, list[str]]:
-    """Parse data from request."""
+def _parse_data(request: ModelRunRequest) -> tuple[np.ndarray, list[str], np.ndarray | None, list[str] | None]:
+    """
+    Parse data from request.
+
+    Returns:
+        Tuple of (data, product_columns, covariates, covariate_columns)
+        covariates and covariate_columns may be None if not provided
+    """
     if request.data is None and request.data_id is None:
         raise HTTPException(400, "Either data or data_id must be provided")
-    
+
+    covariates = None
+    covariate_columns = None
+
     if request.data is not None:
         if request.data.csv_base64:
             # Decode base64 CSV
             csv_bytes = base64.b64decode(request.data.csv_base64)
             df = pd.read_csv(io.BytesIO(csv_bytes))
-            
+
             # Use product_columns if specified, otherwise use all numeric columns
             if request.product_columns:
                 columns = request.product_columns
             else:
                 columns = df.select_dtypes(include=[np.number]).columns.tolist()
-            
+
             data = df[columns].values.astype(float)
-            return data, columns
-        
+
+            # Parse covariates if column names provided
+            if request.data.covariate_column_names:
+                covariate_columns = request.data.covariate_column_names
+                covariates = df[covariate_columns].values.astype(float)
+
+            return data, columns, covariates, covariate_columns
+
         elif request.data.data_json:
             data = np.array(request.data.data_json)
             columns = request.product_columns or [f"Product_{i}" for i in range(data.shape[1])]
-            return data, columns
-    
+
+            # Parse covariates from JSON if provided
+            if request.data.covariates_json:
+                covariates = np.array(request.data.covariates_json)
+                covariate_columns = request.data.covariate_column_names or [
+                    f"Covariate_{i}" for i in range(covariates.shape[1])
+                ]
+
+            return data, columns, covariates, covariate_columns
+
     # TODO: Handle data_id reference to previously uploaded data
     raise HTTPException(400, "Data parsing failed")
 
@@ -115,25 +138,33 @@ async def submit_model_run(
 ):
     """
     Submit a new model run for background processing.
-    
+
     The run will be queued for processing by an ARQ worker.
     Use the returned run ID to check status and retrieve results.
     """
     # Parse the data
     try:
-        data, product_columns = _parse_data(request)
+        data, product_columns, covariates, covariate_columns = _parse_data(request)
     except Exception as e:
         raise HTTPException(400, f"Failed to parse data: {str(e)}")
-    
+
     # Validate model type is supported
     model_type = request.model_type.value
     if model_type not in TASK_REGISTRY:
         raise HTTPException(400, f"Unsupported model type: {model_type}")
-    
+
+    # Validate covariates for LCA with covariates
+    if model_type == "lca_covariates" and covariates is None:
+        raise HTTPException(400, "LCA with covariates requires covariate data")
+
     # Create database record
     run_id = str(uuid4())
     now = datetime.now(timezone.utc)
-    
+
+    data_shape = {"n_obs": data.shape[0], "n_items": data.shape[1]}
+    if covariates is not None:
+        data_shape["n_covariates"] = covariates.shape[1]
+
     model_run = ModelRun(
         id=run_id,
         model_type=_model_type_to_enum(request.model_type),
@@ -143,41 +174,65 @@ async def submit_model_run(
         created_at=now,
         queued_at=now,
         model_params=request.params,
-        data_shape={"n_obs": data.shape[0], "n_items": data.shape[1]},
+        data_shape=data_shape,
         product_columns=product_columns,
         progress=0.0,
         progress_message="Queued for processing",
     )
-    
+
     session.add(model_run)
     await session.commit()
     await session.refresh(model_run)
-    
+
     # Enqueue the task
     try:
         task_func = TASK_REGISTRY[model_type]
         task_name = task_func.__name__
-        
-        await enqueue_job(
-            task_name,
-            run_id,
-            data.tolist(),  # Convert to list for JSON serialization
-            request.params,
-            product_columns,
-            job_id=run_id,
-        )
-        
+
+        # Build task arguments based on model type
+        if model_type == "lca_covariates":
+            await enqueue_job(
+                task_name,
+                run_id,
+                data.tolist(),
+                request.params,
+                product_columns,
+                covariates.tolist() if covariates is not None else None,
+                covariate_columns,
+                job_id=run_id,
+            )
+        elif model_type == "dcm" and covariates is not None:
+            # DCM can also use household features
+            await enqueue_job(
+                task_name,
+                run_id,
+                data.tolist(),
+                request.params,
+                product_columns,
+                covariates.tolist(),
+                job_id=run_id,
+            )
+        else:
+            await enqueue_job(
+                task_name,
+                run_id,
+                data.tolist(),
+                request.params,
+                product_columns,
+                job_id=run_id,
+            )
+
         # Update with job ID
         model_run.arq_job_id = run_id
         await session.commit()
-        
+
     except Exception as e:
         # Mark as failed if we couldn't enqueue
         model_run.status = ModelRunStatus.FAILED
         model_run.error_message = f"Failed to enqueue job: {str(e)}"
         await session.commit()
         raise HTTPException(500, f"Failed to enqueue job: {str(e)}")
-    
+
     return _model_run_to_response(model_run)
 
 
@@ -308,6 +363,30 @@ async def get_model_results(
     # ==========================================
     model_type = run.model_type.value if isinstance(run.model_type, ModelType) else run.model_type
     
+    # Additional model-specific fields
+    residual_correlations = None
+    tetra_corr = None
+    elbo_history = None
+    beta = None
+    odds_ratios = None
+    covariate_columns = None
+    class_probs_per_hh = None
+
+    # LDA-specific fields
+    topic_product_dist = None
+    household_topic_dist = None
+    perplexity = None
+    n_topics = None
+
+    # Network-specific fields
+    adjacency_matrix = None
+    communities = None
+    n_communities = None
+    centrality_scores = None
+    degree_centrality = None
+    betweenness_centrality = None
+    graph_metrics = None
+
     if model_type in ["lca", "lca_covariates"]:
         # LCA models
         item_probs_raw = results.get("item_probs")
@@ -315,32 +394,56 @@ async def get_model_results(
             item_probs = to_list(item_probs_raw)  # (n_classes, n_items)
             # Product embeddings = transpose of item_probs for biplot
             product_embeddings = to_list(item_probs_raw.T)
-        
+
         class_probs = to_list(results.get("class_probs"))
         household_embeddings = to_list(results.get("responsibilities"))
-        
-        # Similarity from residual correlations
-        similarity_matrix = to_list(results.get("residual_correlations"))
-        
+
+        # Residual correlations for similarity
+        residual_corr_raw = results.get("residual_correlations")
+        if residual_corr_raw is not None:
+            residual_correlations = to_list(residual_corr_raw)
+            similarity_matrix = residual_correlations
+
         # For LCA, variance explained = class proportions as percentages
         if class_probs is not None:
             variance_explained = [p * 100 for p in class_probs]
+
+        # LCA with covariates specific fields
+        if model_type == "lca_covariates":
+            beta = to_list(results.get("beta"))
+            odds_ratios = to_list(results.get("odds_ratios"))
+            covariate_columns = results.get("covariate_columns")
+            class_probs_per_hh = to_list(results.get("class_probs_per_hh"))
+
+            # For LCA with covariates, use mean class probs for variance explained
+            if class_probs_per_hh is not None and class_probs is None:
+                mean_class_probs = np.array(class_probs_per_hh).mean(axis=0)
+                class_probs = mean_class_probs.tolist()
+                variance_explained = [p * 100 for p in class_probs]
     
     elif model_type in ["factor_tetrachoric", "bayesian_factor_vi", "bayesian_factor_pymc"]:
         # Factor models
         loadings = to_list(results.get("loadings"))
         loadings_std = to_list(results.get("loadings_std"))
         variance_explained = to_list(results.get("var_explained_pct"))
-        
+
         # Product embeddings = loadings for biplot
         product_embeddings = loadings
         household_embeddings = to_list(results.get("scores"))
-        
+
         # Compute similarity from loadings
         if results.get("loadings") is not None:
             loadings_np = results["loadings"]
             loadings_norm = loadings_np / (np.linalg.norm(loadings_np, axis=1, keepdims=True) + 1e-10)
             similarity_matrix = (loadings_norm @ loadings_norm.T).tolist()
+
+        # Tetrachoric correlation matrix (for tetrachoric FA)
+        if model_type == "factor_tetrachoric":
+            tetra_corr = to_list(results.get("tetra_corr"))
+
+        # ELBO history (for Bayesian VI)
+        if model_type == "bayesian_factor_vi":
+            elbo_history = to_list(results.get("elbo_history"))
     
     elif model_type == "nmf":
         # NMF
@@ -380,18 +483,56 @@ async def get_model_results(
         alpha_std = to_list(results.get("alpha_std"))
         product_latent = to_list(results.get("product_latent"))
         household_latent = to_list(results.get("household_latent"))
-        
+
         # Use product_latent as embeddings and loadings
         product_embeddings = product_latent
         household_embeddings = household_latent
         loadings = product_latent
-        
+
         # Similarity from product latent
         if results.get("product_latent") is not None:
             pl = results["product_latent"]
             pl_norm = pl / (np.linalg.norm(pl, axis=1, keepdims=True) + 1e-10)
             similarity_matrix = (pl_norm @ pl_norm.T).tolist()
-    
+
+    elif model_type == "lda":
+        # Latent Dirichlet Allocation
+        topic_product_dist = to_list(results.get("topic_product_dist"))
+        household_topic_dist = to_list(results.get("household_topic_dist"))
+        perplexity = results.get("perplexity")
+        n_topics = results.get("n_topics")
+
+        # Use loadings and scores for biplot compatibility
+        loadings = to_list(results.get("loadings"))  # topic_product_dist.T
+        product_embeddings = loadings
+        household_embeddings = to_list(results.get("scores"))  # household_topic_dist
+        variance_explained = to_list(results.get("var_explained_pct"))
+
+        # Compute similarity from topic distributions
+        if results.get("topic_product_dist") is not None:
+            tpd = results["topic_product_dist"].T  # (n_products, n_topics)
+            tpd_norm = tpd / (np.linalg.norm(tpd, axis=1, keepdims=True) + 1e-10)
+            similarity_matrix = (tpd_norm @ tpd_norm.T).tolist()
+
+    elif model_type == "network":
+        # Network Analysis
+        adjacency_matrix = to_list(results.get("adjacency_matrix"))
+        communities = results.get("communities")
+        n_communities = results.get("n_communities")
+        centrality_scores = to_list(results.get("centrality_scores"))
+        degree_centrality = to_list(results.get("degree_centrality"))
+        betweenness_centrality = to_list(results.get("betweenness_centrality"))
+        graph_metrics = results.get("graph_metrics")
+
+        # Use loadings and scores for biplot compatibility
+        loadings = to_list(results.get("loadings"))  # community membership
+        product_embeddings = loadings
+        household_embeddings = to_list(results.get("scores"))  # household community scores
+        variance_explained = to_list(results.get("var_explained_pct"))
+
+        # Use adjacency matrix as similarity
+        similarity_matrix = adjacency_matrix
+
     # ==========================================
     # Clean results for JSON serialization
     # ==========================================
@@ -430,6 +571,28 @@ async def get_model_results(
         alpha_std=alpha_std,
         product_latent=product_latent,
         household_latent=household_latent,
+        # LCA with covariates fields
+        beta=beta,
+        odds_ratios=odds_ratios,
+        covariate_columns=covariate_columns,
+        class_probs_per_hh=class_probs_per_hh,
+        # Additional model-specific fields
+        residual_correlations=residual_correlations,
+        tetra_corr=tetra_corr,
+        elbo_history=elbo_history,
+        # LDA-specific fields
+        topic_product_dist=topic_product_dist,
+        household_topic_dist=household_topic_dist,
+        perplexity=perplexity,
+        n_topics=n_topics,
+        # Network-specific fields
+        adjacency_matrix=adjacency_matrix,
+        communities=communities,
+        centrality_scores=centrality_scores,
+        degree_centrality=degree_centrality,
+        betweenness_centrality=betweenness_centrality,
+        graph_metrics=graph_metrics,
+        n_communities=n_communities,
         # Metadata
         product_columns=run.product_columns,
         metrics=run.metrics,

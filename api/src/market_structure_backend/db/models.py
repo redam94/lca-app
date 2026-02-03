@@ -43,6 +43,8 @@ class ModelType(str, Enum):
     NMF = "nmf"
     MCA = "mca"
     DCM = "dcm"
+    LDA = "lda"
+    NETWORK = "network"
 
 
 class ModelRun(Base):

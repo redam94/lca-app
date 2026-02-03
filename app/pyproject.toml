@@ -1,0 +1,13 @@
+[project]
+name = "app"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "market-structure",
+    "streamlit>=1.53.1",
+]
+
+[tool.uv.sources]
+market-structure = { path = "../lca_analysis" }

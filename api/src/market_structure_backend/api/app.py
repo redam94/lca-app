@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse
 
 from ..core.config import get_settings
 from ..db import init_db
-from .routes import runs_router, progress_router, health_router
+from .routes import runs_router, progress_router, health_router, clustering_router, workers_router
 
 
 @asynccontextmanager
@@ -89,7 +89,9 @@ def create_app() -> FastAPI:
     app.include_router(health_router)
     app.include_router(runs_router, prefix="/api/v1")
     app.include_router(progress_router, prefix="/api/v1")
-    
+    app.include_router(clustering_router, prefix="/api/v1")
+    app.include_router(workers_router, prefix="/api/v1")
+
     return app
 
 

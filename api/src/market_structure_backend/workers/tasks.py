@@ -145,7 +145,24 @@ def _create_results_summary(results: dict, model_type: str) -> dict:
             summary["total_inertia"] = float(results["total_inertia"])
         if "n_components" in results:
             summary["n_components"] = results["n_components"]
-    
+
+    elif model_type == "lda":
+        if "var_explained_pct" in results:
+            summary["var_explained_pct"] = _numpy_to_list(results["var_explained_pct"])
+        if "perplexity" in results:
+            summary["perplexity"] = float(results["perplexity"])
+        if "n_topics" in results:
+            summary["n_topics"] = results["n_topics"]
+
+    elif model_type == "network":
+        if "n_communities" in results:
+            summary["n_communities"] = results["n_communities"]
+        if "graph_metrics" in results:
+            gm = results["graph_metrics"]
+            summary["modularity"] = float(gm.get("modularity", 0))
+            summary["density"] = float(gm.get("density", 0))
+            summary["n_edges"] = int(gm.get("n_edges", 0))
+
     return summary
 
 
@@ -253,6 +270,141 @@ async def fit_lca_task(
         
         return {"status": "failed", "run_id": run_id, "error": error_msg}
     
+    finally:
+        await tracker.close()
+
+
+# =============================================================================
+# LCA WITH COVARIATES TASK
+# =============================================================================
+
+async def fit_lca_covariates_task(
+    ctx: dict,
+    run_id: str,
+    data: list[list[float]],
+    params: dict,
+    product_columns: list[str],
+    covariates: Optional[list[list[float]]] = None,
+    covariate_columns: Optional[list[str]] = None,
+):
+    """
+    ARQ task for fitting Latent Class Analysis with household covariates.
+
+    Args:
+        ctx: ARQ context with session_factory and settings from worker startup
+        run_id: Model run ID
+        data: Purchase data matrix (n_households x n_products)
+        params: LCA parameters (n_classes, max_iter, n_init)
+        product_columns: Product column names
+        covariates: Household covariate matrix (n_households x n_features)
+        covariate_columns: Covariate column names
+    """
+    # Get resources from context (initialized at worker startup)
+    settings = _get_settings(ctx)
+    session_factory = _get_session_factory(ctx)
+
+    tracker = await ProgressTracker.create(settings.redis_url)
+
+    try:
+        # Update status to RUNNING
+        await _update_run_status(
+            session_factory, run_id, ModelRunStatus.RUNNING,
+            started_at=datetime.now(timezone.utc)
+        )
+        await tracker.start_tracking(run_id)
+
+        # Convert data to numpy arrays
+        X = np.array(data)
+
+        if covariates is None or len(covariates) == 0:
+            raise ValueError("LCA with covariates requires covariate data")
+
+        Z = np.array(covariates)
+
+        # Standardize covariates for better optimization
+        covariate_means = Z.mean(axis=0)
+        covariate_stds = Z.std(axis=0) + 1e-10
+        Z_standardized = (Z - covariate_means) / covariate_stds
+
+        # Import the model fitting function
+        from .model_implementations import fit_lca_covariates_with_progress
+
+        # Create progress callback
+        progress_callback = EMProgressCallback(
+            model_run_id=run_id,
+            tracker=tracker,
+            max_iter=params.get("max_iter", 100),
+        )
+
+        # Force garbage collection before executor
+        gc.collect()
+
+        # Fit the model
+        result = await fit_lca_covariates_with_progress(
+            X,
+            Z_standardized,
+            n_classes=params["n_classes"],
+            max_iter=params.get("max_iter", 100),
+            n_init=params.get("n_init", 10),
+            tol=params.get("tol", 1e-6),
+            progress_callback=progress_callback,
+        )
+
+        # Add covariate metadata to result
+        result['covariate_columns'] = covariate_columns or [f"Covariate_{i}" for i in range(Z.shape[1])]
+        result['covariate_means'] = covariate_means.tolist()
+        result['covariate_stds'] = covariate_stds.tolist()
+        result['feature_names'] = ['Intercept'] + result['covariate_columns']
+
+        # Compute odds ratios for interpretation
+        if 'beta' in result:
+            odds_ratios = np.exp(result['beta'])
+            result['odds_ratios'] = odds_ratios
+
+        # Save results
+        results_path = await _save_results(run_id, result)
+        results_summary = _create_results_summary(result, "lca_covariates")
+
+        # Extract metrics
+        metrics = {
+            "bic": float(result.get("bic", 0)),
+            "aic": float(result.get("aic", 0)),
+            "log_likelihood": float(result.get("log_likelihood", 0)),
+            "n_features": int(result.get("n_features", 0)),
+        }
+
+        # Update database
+        await _update_run_status(
+            session_factory, run_id, ModelRunStatus.COMPLETED,
+            completed_at=datetime.now(timezone.utc),
+            progress=1.0,
+            progress_message="LCA with covariates completed successfully",
+            results_path=results_path,
+            results_summary=results_summary,
+            metrics=metrics,
+        )
+
+        await tracker.complete(run_id, "LCA with covariates completed successfully")
+
+        return {"status": "completed", "run_id": run_id}
+
+    except Exception as e:
+        error_msg = str(e)
+        error_tb = traceback.format_exc()
+
+        await _update_run_status(
+            session_factory, run_id, ModelRunStatus.FAILED,
+            completed_at=datetime.now(timezone.utc),
+            error_message=error_msg,
+            error_traceback=error_tb,
+            progress=-1.0,
+            progress_message=f"Failed: {error_msg}",
+        )
+
+        await tracker.fail(run_id, error_msg)
+
+        return {"status": "failed", "run_id": run_id, "error": error_msg}
+
     finally:
         await tracker.close()
 
@@ -767,19 +919,205 @@ async def fit_mca_task(
 
 
 # =============================================================================
+# LDA TASK
+# =============================================================================
+
+async def fit_lda_task(
+    ctx: dict,
+    run_id: str,
+    data: list[list[float]],
+    params: dict,
+    product_columns: list[str],
+):
+    """
+    ARQ task for fitting Latent Dirichlet Allocation.
+
+    Args:
+        ctx: ARQ context with session_factory and settings from worker startup
+        run_id: Model run ID
+        data: Purchase data matrix (n_households x n_products)
+        params: LDA parameters (n_topics, max_iter, learning_method)
+        product_columns: Product column names
+    """
+    # Get resources from context
+    settings = _get_settings(ctx)
+    session_factory = _get_session_factory(ctx)
+
+    tracker = await ProgressTracker.create(settings.redis_url)
+
+    try:
+        await _update_run_status(
+            session_factory, run_id, ModelRunStatus.RUNNING,
+            started_at=datetime.now(timezone.utc)
+        )
+        await tracker.start_tracking(run_id)
+
+        X = np.array(data)
+
+        from .model_implementations import fit_lda_with_progress
+
+        progress_callback = EMProgressCallback(
+            model_run_id=run_id,
+            tracker=tracker,
+            max_iter=params.get("max_iter", 100),
+        )
+
+        gc.collect()
+
+        result = await fit_lda_with_progress(
+            X,
+            n_topics=params["n_topics"],
+            max_iter=params.get("max_iter", 100),
+            learning_method=params.get("learning_method", "online"),
+            progress_callback=progress_callback,
+        )
+
+        results_path = await _save_results(run_id, result)
+        results_summary = _create_results_summary(result, "lda")
+
+        metrics = {
+            "perplexity": float(result.get("perplexity", 0)),
+            "log_likelihood": float(result.get("log_likelihood", 0)),
+            "n_topics": int(result.get("n_topics", 0)),
+        }
+
+        await _update_run_status(
+            session_factory, run_id, ModelRunStatus.COMPLETED,
+            completed_at=datetime.now(timezone.utc),
+            progress=1.0,
+            progress_message="LDA completed",
+            results_path=results_path,
+            results_summary=results_summary,
+            metrics=metrics,
+        )
+
+        await tracker.complete(run_id, "LDA completed successfully")
+
+        return {"status": "completed", "run_id": run_id}
+
+    except Exception as e:
+        error_msg = str(e)
+        await _update_run_status(
+            session_factory, run_id, ModelRunStatus.FAILED,
+            completed_at=datetime.now(timezone.utc),
+            error_message=error_msg,
+            error_traceback=traceback.format_exc(),
+        )
+        await tracker.fail(run_id, error_msg)
+        return {"status": "failed", "run_id": run_id, "error": error_msg}
+    finally:
+        await tracker.close()
+
+
+# =============================================================================
+# NETWORK ANALYSIS TASK
+# =============================================================================
+
+async def fit_network_task(
+    ctx: dict,
+    run_id: str,
+    data: list[list[float]],
+    params: dict,
+    product_columns: list[str],
+):
+    """
+    ARQ task for fitting Network Analysis.
+
+    Args:
+        ctx: ARQ context with session_factory and settings from worker startup
+        run_id: Model run ID
+        data: Purchase data matrix (n_households x n_products)
+        params: Network parameters (threshold, community_method, edge_method)
+        product_columns: Product column names
+    """
+    # Get resources from context
+    settings = _get_settings(ctx)
+    session_factory = _get_session_factory(ctx)
+
+    tracker = await ProgressTracker.create(settings.redis_url)
+
+    try:
+        await _update_run_status(
+            session_factory, run_id, ModelRunStatus.RUNNING,
+            started_at=datetime.now(timezone.utc)
+        )
+        await tracker.start_tracking(run_id)
+
+        X = np.array(data)
+
+        from .model_implementations import fit_network_with_progress
+
+        progress_callback = EMProgressCallback(
+            model_run_id=run_id,
+            tracker=tracker,
+            max_iter=1,  # Network analysis is not iterative
+        )
+
+        gc.collect()
+
+        result = await fit_network_with_progress(
+            X,
+            threshold=params.get("threshold", 0.1),
+            community_method=params.get("community_method", "louvain"),
+            edge_method=params.get("edge_method", "lift"),
+            progress_callback=progress_callback,
+        )
+
+        results_path = await _save_results(run_id, result)
+        results_summary = _create_results_summary(result, "network")
+
+        graph_metrics = result.get("graph_metrics", {})
+        metrics = {
+            "n_communities": int(result.get("n_communities", 0)),
+            "modularity": float(graph_metrics.get("modularity", 0)),
+            "density": float(graph_metrics.get("density", 0)),
+            "n_edges": int(graph_metrics.get("n_edges", 0)),
+        }
+
+        await _update_run_status(
+            session_factory, run_id, ModelRunStatus.COMPLETED,
+            completed_at=datetime.now(timezone.utc),
+            progress=1.0,
+            progress_message="Network analysis completed",
+            results_path=results_path,
+            results_summary=results_summary,
+            metrics=metrics,
+        )
+
+        await tracker.complete(run_id, "Network analysis completed successfully")
+
+        return {"status": "completed", "run_id": run_id}
+
+    except Exception as e:
+        error_msg = str(e)
+        await _update_run_status(
+            session_factory, run_id, ModelRunStatus.FAILED,
+            completed_at=datetime.now(timezone.utc),
+            error_message=error_msg,
+            error_traceback=traceback.format_exc(),
+        )
+        await tracker.fail(run_id, error_msg)
+        return {"status": "failed", "run_id": run_id, "error": error_msg}
+    finally:
+        await tracker.close()
+
+
+# =============================================================================
 # TASK REGISTRY
 # =============================================================================
 
 # Map model types to task functions
 TASK_REGISTRY = {
     "lca": fit_lca_task,
-    "lca_covariates": fit_lca_task,  # Same task, different params
+    "lca_covariates": fit_lca_covariates_task,  # Separate task for covariates
     "factor_tetrachoric": fit_factor_tetrachoric_task,
     "bayesian_factor_vi": fit_bayesian_vi_task,
     "bayesian_factor_pymc": fit_bayesian_factor_pymc_task,
     "nmf": fit_nmf_task,
     "mca": fit_mca_task,
     "dcm": fit_dcm_task,
+    "lda": fit_lda_task,
+    "network": fit_network_task,
 }
 
 

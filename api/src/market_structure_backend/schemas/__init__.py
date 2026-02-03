@@ -4,6 +4,7 @@ from .api import (
     # Enums
     ModelTypeEnum,
     ModelRunStatusEnum,
+    ClusteringMethodEnum,
     # Parameter schemas
     LCAParams,
     LCACovariatesParams,
@@ -17,6 +18,7 @@ from .api import (
     DataUpload,
     ModelRunRequest,
     ModelRunListParams,
+    ClusteringRequest,
     # Response schemas
     ProgressResponse,
     ModelRunResponse,
@@ -24,11 +26,18 @@ from .api import (
     ModelResultsResponse,
     HealthResponse,
     ErrorResponse,
+    ClusteringResponse,
+    # Worker status schemas
+    JobInfo,
+    QueueStats,
+    WorkerInfo,
+    WorkerStatusResponse,
 )
 
 __all__ = [
     "ModelTypeEnum",
     "ModelRunStatusEnum",
+    "ClusteringMethodEnum",
     "LCAParams",
     "LCACovariatesParams",
     "FactorParams",
@@ -40,10 +49,16 @@ __all__ = [
     "DataUpload",
     "ModelRunRequest",
     "ModelRunListParams",
+    "ClusteringRequest",
     "ProgressResponse",
     "ModelRunResponse",
     "ModelRunListResponse",
     "ModelResultsResponse",
     "HealthResponse",
     "ErrorResponse",
+    "ClusteringResponse",
+    "JobInfo",
+    "QueueStats",
+    "WorkerInfo",
+    "WorkerStatusResponse",
 ]

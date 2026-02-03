@@ -20,14 +20,19 @@ import numpy as np
 # Import model functions from the lca_analysis package
 from market_structure.models import (
     fit_lca,
+    fit_lca_with_covariates,
     fit_factor_analysis_tetrachoric,
     fit_bayesian_factor_vi,
     fit_nmf,
+    fit_lda,
 )
-from market_structure.config import PYMC_AVAILABLE, PRINCE_AVAILABLE
+from market_structure.config import PYMC_AVAILABLE, PRINCE_AVAILABLE, NETWORKX_AVAILABLE
 
 if PRINCE_AVAILABLE:
     from market_structure.models import fit_mca
+
+if NETWORKX_AVAILABLE:
+    from market_structure.models import fit_network_analysis
 
 if PYMC_AVAILABLE:
     from market_structure.models import fit_bayesian_factor_model_pymc, fit_discrete_choice_model
@@ -97,6 +102,58 @@ async def fit_lca_with_progress(
         
         return result
     
+    return await _run_in_executor(fit_with_callback)
+
+
+async def fit_lca_covariates_with_progress(
+    data: np.ndarray,
+    covariates: np.ndarray,
+    n_classes: int,
+    max_iter: int = 100,
+    n_init: int = 10,
+    tol: float = 1e-6,
+    progress_callback: Optional[Callable] = None,
+) -> dict:
+    """
+    Async wrapper for LCA with covariates fitting with progress callbacks.
+
+    Args:
+        data: (n_households, n_items) binary purchase matrix
+        covariates: (n_households, n_features) household features (standardized)
+        n_classes: Number of latent classes
+        max_iter: Maximum EM iterations
+        n_init: Number of random initializations
+        tol: Convergence tolerance
+        progress_callback: Optional callback for progress updates
+
+    Returns:
+        Dictionary with model results including beta coefficients and odds ratios
+    """
+    def fit_with_callback():
+        # Report start
+        if progress_callback:
+            progress_callback(iteration=0, log_likelihood=None, delta=None, extra={"status": "starting"})
+
+        result = fit_lca_with_covariates(
+            data,
+            covariates,
+            n_classes=n_classes,
+            max_iter=max_iter,
+            n_init=n_init,
+            tol=tol,
+        )
+
+        # Report completion
+        if progress_callback:
+            progress_callback(
+                iteration=max_iter,
+                log_likelihood=result.get("log_likelihood"),
+                delta=None,
+                extra={"status": "completed"}
+            )
+
+        return result
+
     return await _run_in_executor(fit_with_callback)
 
 
@@ -319,5 +376,99 @@ async def fit_dcm_with_progress(
                 latent_prior_scale=latent_prior_scale,
             )
         return result
-    
+
+    return await _run_in_executor(fit_with_callback)
+
+
+# =============================================================================
+# LDA WRAPPER
+# =============================================================================
+
+async def fit_lda_with_progress(
+    data: np.ndarray,
+    n_topics: int,
+    max_iter: int = 100,
+    learning_method: str = "online",
+    progress_callback: Optional[Callable] = None,
+) -> dict:
+    """
+    Async wrapper for Latent Dirichlet Allocation.
+
+    Args:
+        data: (n_households, n_products) binary purchase matrix
+        n_topics: Number of topics to discover
+        max_iter: Maximum iterations
+        learning_method: 'online' or 'batch'
+        progress_callback: Optional callback for progress updates
+
+    Returns:
+        Dictionary with LDA model results
+    """
+    def fit_with_callback():
+        if progress_callback:
+            progress_callback(iteration=0, log_likelihood=None, delta=None, extra={"status": "starting"})
+
+        result = fit_lda(
+            data,
+            n_topics=n_topics,
+            max_iter=max_iter,
+            learning_method=learning_method,
+        )
+
+        if progress_callback:
+            progress_callback(
+                iteration=max_iter,
+                log_likelihood=result.get("log_likelihood"),
+                delta=None,
+                extra={"status": "completed"}
+            )
+
+        return result
+
+    return await _run_in_executor(fit_with_callback)
+
+
+# =============================================================================
+# NETWORK ANALYSIS WRAPPER
+# =============================================================================
+
+async def fit_network_with_progress(
+    data: np.ndarray,
+    threshold: float = 0.1,
+    community_method: str = "louvain",
+    edge_method: str = "lift",
+    progress_callback: Optional[Callable] = None,
+) -> dict:
+    """
+    Async wrapper for Network Analysis.
+
+    Args:
+        data: (n_households, n_products) binary purchase matrix
+        threshold: Minimum edge weight threshold
+        community_method: Community detection method
+        edge_method: Edge weight calculation method
+        progress_callback: Optional callback for progress updates
+
+    Returns:
+        Dictionary with network analysis results
+    """
+    if not NETWORKX_AVAILABLE:
+        raise ImportError("Network analysis requires the 'networkx' package to be installed")
+
+    def fit_with_callback():
+        if progress_callback:
+            progress_callback(iteration=0, log_likelihood=None, delta=None, extra={"status": "starting"})
+
+        result = fit_network_analysis(
+            data,
+            threshold=threshold,
+            community_method=community_method,
+            edge_method=edge_method,
+        )
+
+        if progress_callback:
+            progress_callback(iteration=1, log_likelihood=None, delta=None, extra={"status": "completed"})
+
+        return result
+
     return await _run_in_executor(fit_with_callback)
