@@ -20,6 +20,7 @@ from uuid import uuid4
 import numpy as np
 import pandas as pd
 from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi.responses import StreamingResponse, HTMLResponse
 from sqlalchemy import select, func, desc, asc
 from sqlalchemy.ext.asyncio import AsyncSession
 import zipfile
@@ -472,10 +473,16 @@ async def get_model_results(
         # Use column_coordinates as loadings
         loadings = product_embeddings
         
-        # MCA may filter products - use product_labels if available
+        # MCA may filter products - use product_labels only if they're real names
+        # (not the fallback "item_0", "item_1" pattern from missing product_names)
         mca_product_labels = results.get("product_labels")
         if mca_product_labels and len(mca_product_labels) > 0:
-            product_columns = list(mca_product_labels)
+            has_real_names = not all(
+                label.startswith("item_") and label[5:].isdigit()
+                for label in mca_product_labels
+            )
+            if has_real_names:
+                product_columns = list(mca_product_labels)
     
     elif model_type == "dcm":
         # Discrete Choice Model
@@ -853,5 +860,1122 @@ plot(hc)
     return StreamingResponse(
         zip_buffer,
         media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
+
+# =============================================================================
+# HTML REPORT GENERATION
+# =============================================================================
+
+def _get_model_display_name(model_type: str) -> str:
+    """Get display name for model type."""
+    names = {
+        "lca": "Latent Class Analysis",
+        "lca_covariates": "LCA with Covariates",
+        "factor_tetrachoric": "Factor Analysis (Tetrachoric)",
+        "bayesian_factor_vi": "Bayesian Factor (VI)",
+        "bayesian_factor_pymc": "Bayesian Factor (PyMC)",
+        "nmf": "Non-negative Matrix Factorization",
+        "mca": "Multiple Correspondence Analysis",
+        "dcm": "Discrete Choice Model",
+        "lda": "Latent Dirichlet Allocation",
+        "network": "Network Analysis",
+    }
+    return names.get(model_type, model_type)
+
+
+def _extract_report_data(results: dict, model_type: str, product_columns: list) -> dict:
+    """
+    Extract and compute all data needed for the report from raw results.
+    This mirrors the logic in get_model_results() endpoint.
+    """
+    extracted = {
+        "product_columns": product_columns,
+        "similarity_matrix": None,
+        "loadings": None,
+        "loadings_std": None,
+        "variance_explained": None,
+        "product_embeddings": None,
+        "item_probs": None,
+        "class_probs": None,
+        "tetra_corr": None,
+        "elbo_history": None,
+        "topic_product_dist": None,
+        "adjacency_matrix": None,
+        "alpha": None,
+        "alpha_std": None,
+    }
+
+    if model_type in ["lca", "lca_covariates"]:
+        # LCA models
+        item_probs_raw = results.get("item_probs")
+        if item_probs_raw is not None:
+            extracted["item_probs"] = np.array(item_probs_raw)
+            extracted["product_embeddings"] = np.array(item_probs_raw).T
+
+        class_probs_raw = results.get("class_probs")
+        if class_probs_raw is not None:
+            extracted["class_probs"] = np.array(class_probs_raw)
+            extracted["variance_explained"] = np.array(class_probs_raw) * 100
+
+        # Residual correlations for similarity
+        residual_corr = results.get("residual_correlations")
+        if residual_corr is not None:
+            extracted["similarity_matrix"] = np.array(residual_corr)
+
+    elif model_type in ["factor_tetrachoric", "bayesian_factor_vi", "bayesian_factor_pymc"]:
+        # Factor models
+        loadings_raw = results.get("loadings")
+        if loadings_raw is not None:
+            loadings = np.array(loadings_raw)
+            extracted["loadings"] = loadings
+            extracted["product_embeddings"] = loadings
+
+            # Compute similarity from loadings
+            loadings_norm = loadings / (np.linalg.norm(loadings, axis=1, keepdims=True) + 1e-10)
+            extracted["similarity_matrix"] = loadings_norm @ loadings_norm.T
+
+        loadings_std = results.get("loadings_std")
+        if loadings_std is not None:
+            extracted["loadings_std"] = np.array(loadings_std)
+
+        var_explained = results.get("var_explained_pct")
+        if var_explained is not None:
+            extracted["variance_explained"] = np.array(var_explained)
+
+        # Tetrachoric correlation matrix
+        if model_type == "factor_tetrachoric":
+            tetra = results.get("tetra_corr")
+            if tetra is not None:
+                extracted["tetra_corr"] = np.array(tetra)
+
+        # ELBO history
+        if model_type == "bayesian_factor_vi":
+            elbo = results.get("elbo_history")
+            if elbo is not None:
+                extracted["elbo_history"] = list(elbo)
+
+    elif model_type == "nmf":
+        loadings_raw = results.get("loadings")
+        if loadings_raw is not None:
+            loadings = np.array(loadings_raw)
+            extracted["loadings"] = loadings
+            extracted["product_embeddings"] = loadings
+
+        var_explained = results.get("var_explained_pct")
+        if var_explained is not None:
+            extracted["variance_explained"] = np.array(var_explained)
+
+        # Similarity from H matrix
+        H = results.get("H")
+        if H is not None:
+            H = np.array(H)
+            H_norm = H / (np.linalg.norm(H, axis=0, keepdims=True) + 1e-10)
+            extracted["similarity_matrix"] = H_norm.T @ H_norm
+
+    elif model_type == "mca":
+        col_coords = results.get("column_coordinates")
+        if col_coords is not None:
+            coords = np.array(col_coords)
+            extracted["loadings"] = coords
+            extracted["product_embeddings"] = coords
+
+        var_explained = results.get("var_explained_pct")
+        if var_explained is not None:
+            extracted["variance_explained"] = np.array(var_explained)
+
+        sim = results.get("similarity_matrix")
+        if sim is not None:
+            extracted["similarity_matrix"] = np.array(sim)
+
+        # MCA may filter products - use product_labels only if they're real names
+        # (not the fallback "item_0", "item_1" pattern from missing product_names)
+        mca_labels = results.get("product_labels")
+        if mca_labels and len(mca_labels) > 0:
+            # Check if labels are real names or fallback pattern
+            has_real_names = not all(
+                label.startswith("item_") and label[5:].isdigit()
+                for label in mca_labels
+            )
+            if has_real_names:
+                extracted["product_columns"] = list(mca_labels)
+
+    elif model_type == "dcm":
+        alpha = results.get("alpha")
+        if alpha is not None:
+            extracted["alpha"] = np.array(alpha)
+        alpha_std = results.get("alpha_std")
+        if alpha_std is not None:
+            extracted["alpha_std"] = np.array(alpha_std)
+
+        product_latent = results.get("product_latent")
+        if product_latent is not None:
+            pl = np.array(product_latent)
+            extracted["loadings"] = pl
+            extracted["product_embeddings"] = pl
+            pl_norm = pl / (np.linalg.norm(pl, axis=1, keepdims=True) + 1e-10)
+            extracted["similarity_matrix"] = pl_norm @ pl_norm.T
+
+    elif model_type == "lda":
+        topic_dist = results.get("topic_product_dist")
+        if topic_dist is not None:
+            tpd = np.array(topic_dist)
+            extracted["topic_product_dist"] = tpd
+            extracted["loadings"] = tpd.T
+            extracted["product_embeddings"] = tpd.T
+
+            # Similarity from topic distributions
+            tpd_norm = tpd.T / (np.linalg.norm(tpd.T, axis=1, keepdims=True) + 1e-10)
+            extracted["similarity_matrix"] = tpd_norm @ tpd_norm.T
+
+        var_explained = results.get("var_explained_pct")
+        if var_explained is not None:
+            extracted["variance_explained"] = np.array(var_explained)
+
+    elif model_type == "network":
+        adj = results.get("adjacency_matrix")
+        if adj is not None:
+            extracted["adjacency_matrix"] = np.array(adj)
+            extracted["similarity_matrix"] = np.array(adj)
+
+        loadings_raw = results.get("loadings")
+        if loadings_raw is not None:
+            extracted["loadings"] = np.array(loadings_raw)
+            extracted["product_embeddings"] = np.array(loadings_raw)
+
+        var_explained = results.get("var_explained_pct")
+        if var_explained is not None:
+            extracted["variance_explained"] = np.array(var_explained)
+
+    return extracted
+
+
+def _generate_plotly_figures(extracted_data: dict, model_type: str) -> dict:
+    """Generate Plotly figures for the report using extracted data."""
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    def to_list(arr):
+        """Convert numpy array to list for Plotly compatibility."""
+        if arr is None:
+            return None
+        if hasattr(arr, 'tolist'):
+            return arr.tolist()
+        return list(arr)
+
+    figures = {}
+    product_columns = extracted_data.get("product_columns", [])
+
+    # Similarity/Correlation Matrix
+    similarity = extracted_data.get("similarity_matrix")
+    if similarity is not None and len(product_columns) > 0:
+        fig = go.Figure(data=go.Heatmap(
+            z=to_list(similarity),
+            x=product_columns,
+            y=product_columns,
+            colorscale="RdBu_r",
+            zmid=0
+        ))
+        fig.update_layout(
+            title="Product Similarity Matrix",
+            xaxis_title="Product",
+            yaxis_title="Product",
+            height=max(500, len(product_columns) * 15),
+            width=max(600, len(product_columns) * 15)
+        )
+        figures["Similarity Matrix"] = fig
+
+    # Variance Explained
+    var_explained = extracted_data.get("variance_explained")
+    if var_explained is not None and len(var_explained) > 0:
+        n_comp = len(var_explained)
+        var_list = to_list(var_explained)
+        cumulative = to_list(np.cumsum(var_explained))
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=[f"Comp {i+1}" for i in range(n_comp)],
+            y=var_list,
+            name="Individual",
+            marker_color="#667eea"
+        ))
+        fig.add_trace(go.Scatter(
+            x=[f"Comp {i+1}" for i in range(n_comp)],
+            y=cumulative,
+            name="Cumulative",
+            mode="lines+markers",
+            marker_color="#764ba2"
+        ))
+        fig.update_layout(
+            title="Variance Explained",
+            xaxis_title="Component",
+            yaxis_title="Variance Explained (%)",
+            height=400,
+            showlegend=True
+        )
+        figures["Variance Explained"] = fig
+
+    # Loadings Heatmap (factor-type models)
+    loadings = extracted_data.get("loadings")
+    if loadings is not None and len(product_columns) > 0:
+        if len(loadings.shape) == 2 and loadings.shape[0] == len(product_columns):
+            n_factors = loadings.shape[1]
+            factor_names = [f"Factor {i+1}" for i in range(n_factors)]
+            fig = go.Figure(data=go.Heatmap(
+                z=to_list(loadings),
+                x=factor_names,
+                y=product_columns,
+                colorscale="RdBu_r",
+                zmid=0
+            ))
+            fig.update_layout(
+                title="Factor Loadings",
+                xaxis_title="Factor",
+                yaxis_title="Product",
+                height=max(400, len(product_columns) * 20)
+            )
+            figures["Factor Loadings"] = fig
+
+    # LCA Class Profiles
+    item_probs = extracted_data.get("item_probs")
+    class_probs = extracted_data.get("class_probs")
+    if item_probs is not None and class_probs is not None and len(product_columns) > 0:
+        n_classes = len(class_probs)
+        fig = go.Figure()
+        colors = ['#667eea', '#764ba2', '#f093fb', '#f5576c', '#4facfe', '#00f2fe', '#43e97b', '#38f9d7']
+        for c in range(n_classes):
+            fig.add_trace(go.Bar(
+                x=product_columns,
+                y=to_list(item_probs[c]),
+                name=f"Class {c+1} ({float(class_probs[c])*100:.1f}%)",
+                marker_color=colors[c % len(colors)]
+            ))
+        fig.update_layout(
+            title="LCA Class Profiles",
+            xaxis_title="Product",
+            yaxis_title="Purchase Probability",
+            barmode="group",
+            height=500
+        )
+        figures["Class Profiles"] = fig
+
+    # Tetrachoric Correlation (for factor_tetrachoric)
+    tetra_corr = extracted_data.get("tetra_corr")
+    if tetra_corr is not None and len(product_columns) > 0:
+        fig = go.Figure(data=go.Heatmap(
+            z=to_list(tetra_corr),
+            x=product_columns,
+            y=product_columns,
+            colorscale="RdBu_r",
+            zmid=0
+        ))
+        fig.update_layout(
+            title="Tetrachoric Correlation Matrix",
+            xaxis_title="Product",
+            yaxis_title="Product",
+            height=max(500, len(product_columns) * 15)
+        )
+        figures["Tetrachoric Correlation"] = fig
+
+    # ELBO Convergence (for Bayesian VI)
+    elbo_history = extracted_data.get("elbo_history")
+    if elbo_history is not None and len(elbo_history) > 0:
+        fig = go.Figure(data=go.Scatter(
+            x=list(range(1, len(elbo_history) + 1)),
+            y=elbo_history,
+            mode="lines",
+            line=dict(color="#667eea")
+        ))
+        fig.update_layout(
+            title="ELBO Convergence",
+            xaxis_title="Iteration",
+            yaxis_title="ELBO",
+            height=400
+        )
+        figures["ELBO Convergence"] = fig
+
+    # LDA Topic Distribution
+    topic_dist = extracted_data.get("topic_product_dist")
+    if topic_dist is not None and len(product_columns) > 0:
+        n_topics = topic_dist.shape[0]
+        topic_names = [f"Topic {i+1}" for i in range(n_topics)]
+        fig = go.Figure(data=go.Heatmap(
+            z=to_list(topic_dist),
+            x=product_columns,
+            y=topic_names,
+            colorscale="Viridis"
+        ))
+        fig.update_layout(
+            title="Topic-Product Distribution",
+            xaxis_title="Product",
+            yaxis_title="Topic",
+            height=max(300, n_topics * 50)
+        )
+        figures["Topic Distribution"] = fig
+
+    # Network Adjacency Matrix
+    adj_matrix = extracted_data.get("adjacency_matrix")
+    if adj_matrix is not None and len(product_columns) > 0:
+        fig = go.Figure(data=go.Heatmap(
+            z=to_list(adj_matrix),
+            x=product_columns,
+            y=product_columns,
+            colorscale="Blues"
+        ))
+        fig.update_layout(
+            title="Product Co-Purchase Network",
+            xaxis_title="Product",
+            yaxis_title="Product",
+            height=max(500, len(product_columns) * 15)
+        )
+        figures["Network Matrix"] = fig
+
+    # DCM Coefficients
+    alpha = extracted_data.get("alpha")
+    alpha_std = extracted_data.get("alpha_std")
+    if alpha is not None and len(product_columns) > 0:
+        fig = go.Figure()
+        # Sort by alpha value
+        sorted_idx = np.argsort(alpha)[::-1]
+        sorted_products = [product_columns[i] for i in sorted_idx]
+        sorted_alpha = to_list(alpha[sorted_idx])
+
+        if alpha_std is not None:
+            sorted_std = to_list(1.96 * alpha_std[sorted_idx])
+            fig.add_trace(go.Bar(
+                x=sorted_products,
+                y=sorted_alpha,
+                error_y=dict(type='data', array=sorted_std, visible=True),
+                marker_color="#667eea"
+            ))
+        else:
+            fig.add_trace(go.Bar(
+                x=sorted_products,
+                y=sorted_alpha,
+                marker_color="#667eea"
+            ))
+        fig.update_layout(
+            title="DCM Product Intercepts (with 95% CI)",
+            xaxis_title="Product",
+            yaxis_title="Intercept (α)",
+            height=500
+        )
+        figures["Product Intercepts"] = fig
+
+    # Biplot with dimension selector (interactive)
+    product_embeddings = extracted_data.get("product_embeddings")
+    if product_embeddings is not None and len(product_columns) > 0:
+        if len(product_embeddings.shape) == 2 and product_embeddings.shape[1] >= 2:
+            n_dims = product_embeddings.shape[1]
+
+            # Create figure with dropdown for dimension selection
+            fig = go.Figure()
+
+            # Add all dimension combinations as separate traces
+            dim_pairs = []
+            for i in range(min(n_dims, 5)):
+                for j in range(i + 1, min(n_dims, 5)):
+                    dim_pairs.append((i, j))
+
+            for idx, (dim_x, dim_y) in enumerate(dim_pairs):
+                visible = idx == 0  # Only first pair visible by default
+                fig.add_trace(go.Scatter(
+                    x=to_list(product_embeddings[:, dim_x]),
+                    y=to_list(product_embeddings[:, dim_y]),
+                    mode="markers+text",
+                    text=product_columns,
+                    textposition="top center",
+                    marker=dict(size=10, color="#667eea"),
+                    name=f"Dim {dim_x+1} vs {dim_y+1}",
+                    visible=visible
+                ))
+
+            # Create dropdown buttons
+            buttons = []
+            for idx, (dim_x, dim_y) in enumerate(dim_pairs):
+                visibility = [i == idx for i in range(len(dim_pairs))]
+                buttons.append(dict(
+                    label=f"Dim {dim_x+1} vs Dim {dim_y+1}",
+                    method="update",
+                    args=[
+                        {"visible": visibility},
+                        {"xaxis.title": f"Dimension {dim_x+1}",
+                         "yaxis.title": f"Dimension {dim_y+1}"}
+                    ]
+                ))
+
+            fig.update_layout(
+                title="Product Space (Biplot)",
+                xaxis_title="Dimension 1",
+                yaxis_title="Dimension 2",
+                height=600,
+                updatemenus=[
+                    dict(
+                        active=0,
+                        buttons=buttons,
+                        direction="down",
+                        showactive=True,
+                        x=0.0,
+                        xanchor="left",
+                        y=1.15,
+                        yanchor="top"
+                    )
+                ]
+            )
+            figures["Biplot"] = fig
+
+    return figures
+
+
+def _generate_html_report(
+    run: ModelRun,
+    results: dict,
+    figures: dict,
+    clustering_result: Optional[dict] = None
+) -> str:
+    """Generate standalone HTML report."""
+    import plotly.io as pio
+
+    model_type = run.model_type.value if hasattr(run.model_type, 'value') else run.model_type
+    run_name = run.name or f"Run {run.id[:8]}"
+    product_columns = run.product_columns or []
+
+    html_parts = [f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>{run_name} - Analysis Report</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }}
+        .header {{
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            border-radius: 10px;
+            margin-bottom: 30px;
+        }}
+        .header h1 {{ margin: 0 0 10px 0; }}
+        .header .subtitle {{ opacity: 0.9; font-size: 1.1em; }}
+        .card {{
+            background: white;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }}
+        .card h2 {{
+            margin-top: 0;
+            color: #333;
+            border-bottom: 2px solid #667eea;
+            padding-bottom: 10px;
+        }}
+        .metrics-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+        }}
+        .metric {{
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+        }}
+        .metric-value {{
+            font-size: 1.5em;
+            font-weight: bold;
+            color: #667eea;
+        }}
+        .metric-label {{ color: #666; font-size: 0.9em; }}
+        table {{ width: 100%; border-collapse: collapse; }}
+        th, td {{ padding: 10px; text-align: left; border-bottom: 1px solid #eee; }}
+        th {{ background: #f8f9fa; }}
+        .cluster-tag {{
+            display: inline-block;
+            padding: 4px 8px;
+            margin: 2px;
+            border-radius: 4px;
+            font-size: 0.9em;
+            color: white;
+        }}
+        .cluster-section {{
+            margin-bottom: 15px;
+        }}
+        .cluster-title {{
+            font-weight: bold;
+            margin-bottom: 8px;
+        }}
+        .footer {{ text-align: center; color: #666; padding: 20px; font-size: 0.9em; }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>{run_name}</h1>
+        <div class="subtitle">{_get_model_display_name(model_type)} Analysis Report</div>
+        <div class="subtitle">Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}</div>
+    </div>
+
+    <div class="card">
+        <h2>Run Information</h2>
+        <div class="metrics-grid">
+            <div class="metric"><div class="metric-value">{run.id[:12]}...</div><div class="metric-label">Run ID</div></div>
+            <div class="metric"><div class="metric-value">{_get_model_display_name(model_type)}</div><div class="metric-label">Model Type</div></div>
+            <div class="metric"><div class="metric-value">{run.status.value.upper() if hasattr(run.status, 'value') else run.status}</div><div class="metric-label">Status</div></div>
+            <div class="metric"><div class="metric-value">{run.created_at.strftime('%Y-%m-%d') if run.created_at else '-'}</div><div class="metric-label">Created</div></div>
+            <div class="metric"><div class="metric-value">{f'{run.run_duration:.1f}s' if run.run_duration else '-'}</div><div class="metric-label">Duration</div></div>
+            <div class="metric"><div class="metric-value">{len(product_columns)}</div><div class="metric-label">Products</div></div>
+        </div>
+    </div>
+"""]
+
+    # Model parameters
+    if run.model_params:
+        html_parts.append("""
+    <div class="card">
+        <h2>Model Parameters</h2>
+        <table>
+            <tr><th>Parameter</th><th>Value</th></tr>
+""")
+        for key, value in run.model_params.items():
+            html_parts.append(f"            <tr><td>{key}</td><td>{value}</td></tr>\n")
+        html_parts.append("        </table>\n    </div>\n")
+
+    # Metrics
+    if run.metrics:
+        html_parts.append("""
+    <div class="card">
+        <h2>Model Metrics</h2>
+        <div class="metrics-grid">
+""")
+        for key, value in run.metrics.items():
+            display_value = f"{value:.4f}" if isinstance(value, float) else str(value)
+            html_parts.append(f"""            <div class="metric"><div class="metric-value">{display_value}</div><div class="metric-label">{key.replace('_', ' ').title()}</div></div>\n""")
+        html_parts.append("        </div>\n    </div>\n")
+
+    # Figures
+    for title, fig in figures.items():
+        fig_html = pio.to_html(fig, full_html=False, include_plotlyjs=False)
+        html_parts.append(f"""
+    <div class="card">
+        <h2>{title}</h2>
+        {fig_html}
+    </div>
+""")
+
+    # Cluster membership (if clustering was performed)
+    if clustering_result is not None and clustering_result.get("cluster_members"):
+        cluster_members = clustering_result["cluster_members"]
+        n_clusters = clustering_result.get("n_clusters", len(cluster_members))
+        silhouette_score = clustering_result.get("silhouette_score")
+
+        # Cluster colors matching the chart
+        cluster_colors = [
+            "#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00",
+            "#ffff33", "#a65628", "#f781bf", "#999999", "#66c2a5"
+        ]
+
+        html_parts.append(f"""
+    <div class="card">
+        <h2>Cluster Membership</h2>
+        <div class="metrics-grid" style="margin-bottom: 20px;">
+            <div class="metric"><div class="metric-value">{n_clusters}</div><div class="metric-label">Clusters</div></div>
+""")
+        if silhouette_score is not None:
+            html_parts.append(f"""            <div class="metric"><div class="metric-value">{silhouette_score:.3f}</div><div class="metric-label">Silhouette Score</div></div>\n""")
+
+        html_parts.append("        </div>\n")
+
+        # List products by cluster
+        for cluster_id in sorted(cluster_members.keys(), key=lambda x: int(x)):
+            products = cluster_members[cluster_id]
+            color = cluster_colors[int(cluster_id) % len(cluster_colors)]
+            html_parts.append(f"""        <div class="cluster-section">
+            <div class="cluster-title" style="color: {color};">Cluster {int(cluster_id) + 1} ({len(products)} products)</div>
+            <div>
+""")
+            for product in products:
+                html_parts.append(f"""                <span class="cluster-tag" style="background-color: {color};">{product}</span>\n""")
+            html_parts.append("            </div>\n        </div>\n")
+
+        html_parts.append("    </div>\n")
+
+    # Products list
+    if product_columns:
+        html_parts.append(f"""
+    <div class="card">
+        <h2>Products Analyzed ({len(product_columns)})</h2>
+        <p>{', '.join(product_columns)}</p>
+    </div>
+""")
+
+    html_parts.append("""
+    <div class="footer">
+        <p>Generated by Market Structure Analysis API</p>
+    </div>
+</body>
+</html>
+""")
+
+    return "".join(html_parts)
+
+
+@router.get("/{run_id}/report/debug")
+async def debug_report_data(
+    run_id: str,
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Debug endpoint to inspect the data being used for report generation.
+
+    Returns information about what data is available and being extracted.
+    """
+    result = await session.execute(
+        select(ModelRun).where(ModelRun.id == run_id)
+    )
+    run = result.scalar_one_or_none()
+
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+
+    if run.status != ModelRunStatus.COMPLETED:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Run is not completed. Current status: {run.status.value}"
+        )
+
+    if not run.results_path:
+        raise HTTPException(status_code=404, detail="Results file not found")
+
+    results_path = Path(run.results_path)
+    if not results_path.exists():
+        raise HTTPException(status_code=404, detail="Results file not found on disk")
+
+    with open(results_path, "rb") as f:
+        results = pickle.load(f)
+
+    model_type = run.model_type.value if hasattr(run.model_type, 'value') else run.model_type
+    product_columns = run.product_columns or []
+
+    # Get raw pickle keys and shapes
+    raw_info = {}
+    for key, value in results.items():
+        if isinstance(value, np.ndarray):
+            raw_info[key] = f"ndarray shape={value.shape}"
+        elif isinstance(value, list):
+            raw_info[key] = f"list len={len(value)}"
+        elif value is None:
+            raw_info[key] = "None"
+        else:
+            raw_info[key] = f"{type(value).__name__}"
+
+    # Extract data
+    extracted = _extract_report_data(results, model_type, product_columns)
+
+    extracted_info = {}
+    for key, value in extracted.items():
+        if isinstance(value, np.ndarray):
+            extracted_info[key] = f"ndarray shape={value.shape}, sample={value.flat[:3].tolist()}"
+        elif isinstance(value, list):
+            extracted_info[key] = f"list len={len(value)}"
+        elif value is None:
+            extracted_info[key] = "None"
+        else:
+            extracted_info[key] = f"{type(value).__name__}"
+
+    return {
+        "run_id": run_id,
+        "model_type": model_type,
+        "product_columns_count": len(product_columns),
+        "product_columns_sample": product_columns[:5] if product_columns else [],
+        "raw_pickle_info": raw_info,
+        "extracted_data_info": extracted_info,
+    }
+
+
+def _perform_clustering_for_report(
+    extracted_data: dict,
+    n_clusters: Optional[int] = None,
+    max_k: int = 10,
+    method: str = "kmeans"
+) -> Optional[dict]:
+    """
+    Perform clustering on product embeddings for the report.
+
+    Returns clustering results including labels, silhouette scores, etc.
+    """
+    try:
+        from market_structure.utils import (
+            find_optimal_clusters,
+            perform_kmeans_clustering,
+            compute_hierarchical_clustering,
+            get_hierarchical_labels,
+        )
+    except ImportError:
+        return None
+
+    product_embeddings = extracted_data.get("product_embeddings")
+    similarity_matrix = extracted_data.get("similarity_matrix")
+    product_columns = extracted_data.get("product_columns", [])
+
+    if product_embeddings is None or len(product_columns) < 3:
+        return None
+
+    n_products = len(product_columns)
+    max_k = min(max_k, n_products - 1)
+
+    if max_k < 2:
+        return None
+
+    clustering_result = {
+        "labels": None,
+        "n_clusters": None,
+        "silhouette_score": None,
+        "optimal_k": None,
+        "silhouette_scores": None,
+        "k_range": None,
+        "linkage_matrix": None,
+        "cluster_members": {},
+    }
+
+    # Auto-detect optimal k if not specified
+    if n_clusters is None:
+        try:
+            optimal_result = find_optimal_clusters(product_embeddings, max_k=max_k)
+            clustering_result["optimal_k"] = optimal_result["optimal_k"]
+            clustering_result["silhouette_scores"] = optimal_result["scores"]
+            clustering_result["k_range"] = list(optimal_result["range"])
+            n_clusters = optimal_result["optimal_k"]
+        except Exception:
+            n_clusters = min(3, max_k)
+
+    clustering_result["n_clusters"] = n_clusters
+
+    # Perform clustering
+    if method == "kmeans":
+        try:
+            kmeans_result = perform_kmeans_clustering(product_embeddings, n_clusters)
+            clustering_result["labels"] = kmeans_result["labels"].tolist()
+            clustering_result["silhouette_score"] = kmeans_result.get("silhouette_score")
+        except Exception:
+            return None
+    else:
+        # Hierarchical clustering
+        if similarity_matrix is None:
+            return None
+        try:
+            hier_result = compute_hierarchical_clustering(similarity_matrix, method="ward")
+            clustering_result["linkage_matrix"] = hier_result["linkage_matrix"].tolist()
+            clustering_result["labels"] = get_hierarchical_labels(
+                hier_result["linkage_matrix"], n_clusters
+            ).tolist()
+        except Exception:
+            return None
+
+    # Create cluster membership mapping
+    if clustering_result["labels"] is not None:
+        for i, (product, label) in enumerate(zip(product_columns, clustering_result["labels"])):
+            cluster_id = str(label)
+            if cluster_id not in clustering_result["cluster_members"]:
+                clustering_result["cluster_members"][cluster_id] = []
+            clustering_result["cluster_members"][cluster_id].append(product)
+
+    return clustering_result
+
+
+def _generate_clustering_figures(
+    extracted_data: dict,
+    clustering_result: dict
+) -> dict:
+    """Generate Plotly figures for clustering visualization."""
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    import plotly.express as px
+
+    def to_list(arr):
+        if arr is None:
+            return None
+        if hasattr(arr, 'tolist'):
+            return arr.tolist()
+        return list(arr)
+
+    figures = {}
+    product_columns = extracted_data.get("product_columns", [])
+    product_embeddings = extracted_data.get("product_embeddings")
+    labels = clustering_result.get("labels")
+
+    if labels is None or product_embeddings is None:
+        return figures
+
+    n_clusters = clustering_result.get("n_clusters", max(labels) + 1)
+
+    # Color palette for clusters
+    colors = px.colors.qualitative.Set1[:n_clusters] if n_clusters <= 9 else px.colors.qualitative.Alphabet[:n_clusters]
+
+    # Clustered Biplot with dimension selector
+    if len(product_embeddings.shape) == 2 and product_embeddings.shape[1] >= 2:
+        n_dims = product_embeddings.shape[1]
+        fig = go.Figure()
+
+        dim_pairs = []
+        for i in range(min(n_dims, 5)):
+            for j in range(i + 1, min(n_dims, 5)):
+                dim_pairs.append((i, j))
+
+        # For each dimension pair, add traces for each cluster
+        trace_count = 0
+        for pair_idx, (dim_x, dim_y) in enumerate(dim_pairs):
+            visible = pair_idx == 0
+            for cluster_id in range(n_clusters):
+                cluster_mask = [l == cluster_id for l in labels]
+                cluster_x = [product_embeddings[i, dim_x] for i, m in enumerate(cluster_mask) if m]
+                cluster_y = [product_embeddings[i, dim_y] for i, m in enumerate(cluster_mask) if m]
+                cluster_text = [product_columns[i] for i, m in enumerate(cluster_mask) if m]
+
+                fig.add_trace(go.Scatter(
+                    x=to_list(cluster_x),
+                    y=to_list(cluster_y),
+                    mode="markers+text",
+                    text=cluster_text,
+                    textposition="top center",
+                    marker=dict(size=12, color=colors[cluster_id % len(colors)]),
+                    name=f"Cluster {cluster_id + 1}",
+                    legendgroup=f"cluster_{cluster_id}",
+                    showlegend=pair_idx == 0,
+                    visible=visible
+                ))
+                trace_count += 1
+
+        # Create dropdown buttons for dimension pairs
+        buttons = []
+        traces_per_pair = n_clusters
+        for pair_idx, (dim_x, dim_y) in enumerate(dim_pairs):
+            visibility = []
+            for p_idx in range(len(dim_pairs)):
+                for _ in range(traces_per_pair):
+                    visibility.append(p_idx == pair_idx)
+            buttons.append(dict(
+                label=f"Dim {dim_x+1} vs Dim {dim_y+1}",
+                method="update",
+                args=[
+                    {"visible": visibility},
+                    {"xaxis.title": f"Dimension {dim_x+1}",
+                     "yaxis.title": f"Dimension {dim_y+1}"}
+                ]
+            ))
+
+        fig.update_layout(
+            title=f"Clustered Product Space (k={n_clusters})",
+            xaxis_title="Dimension 1",
+            yaxis_title="Dimension 2",
+            height=600,
+            updatemenus=[
+                dict(
+                    active=0,
+                    buttons=buttons,
+                    direction="down",
+                    showactive=True,
+                    x=0.0,
+                    xanchor="left",
+                    y=1.15,
+                    yanchor="top"
+                )
+            ] if len(buttons) > 1 else []
+        )
+        figures["Clustered Biplot"] = fig
+
+    # Silhouette scores plot (if auto-detection was used)
+    silhouette_scores = clustering_result.get("silhouette_scores")
+    k_range = clustering_result.get("k_range")
+    optimal_k = clustering_result.get("optimal_k")
+
+    if silhouette_scores is not None and k_range is not None:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=k_range,
+            y=silhouette_scores,
+            mode="lines+markers",
+            name="Silhouette Score",
+            line=dict(color="#667eea"),
+            marker=dict(size=8)
+        ))
+
+        # Mark optimal k
+        if optimal_k is not None and optimal_k in k_range:
+            opt_idx = k_range.index(optimal_k)
+            fig.add_trace(go.Scatter(
+                x=[optimal_k],
+                y=[silhouette_scores[opt_idx]],
+                mode="markers",
+                name=f"Optimal k={optimal_k}",
+                marker=dict(size=15, color="red", symbol="star")
+            ))
+
+        fig.update_layout(
+            title="Cluster Selection: Silhouette Analysis",
+            xaxis_title="Number of Clusters (k)",
+            yaxis_title="Silhouette Score",
+            height=400
+        )
+        figures["Silhouette Analysis"] = fig
+
+    # Cluster membership table/bar chart
+    cluster_members = clustering_result.get("cluster_members", {})
+    if cluster_members:
+        cluster_sizes = [(f"Cluster {int(k)+1}", len(v)) for k, v in sorted(cluster_members.items(), key=lambda x: int(x[0]))]
+
+        fig = go.Figure(data=[
+            go.Bar(
+                x=[c[0] for c in cluster_sizes],
+                y=[c[1] for c in cluster_sizes],
+                marker_color=[colors[i % len(colors)] for i in range(len(cluster_sizes))],
+                text=[c[1] for c in cluster_sizes],
+                textposition="auto"
+            )
+        ])
+        fig.update_layout(
+            title="Cluster Sizes",
+            xaxis_title="Cluster",
+            yaxis_title="Number of Products",
+            height=400
+        )
+        figures["Cluster Sizes"] = fig
+
+    # Dendrogram for hierarchical clustering
+    linkage_matrix = clustering_result.get("linkage_matrix")
+    if linkage_matrix is not None:
+        try:
+            from scipy.cluster.hierarchy import dendrogram
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+
+            # Create dendrogram data
+            plt.figure(figsize=(12, 6))
+            dend = dendrogram(
+                np.array(linkage_matrix),
+                labels=product_columns,
+                leaf_rotation=90,
+                no_plot=True
+            )
+
+            # Convert to Plotly
+            fig = go.Figure()
+
+            # Add dendrogram lines
+            icoord = dend['icoord']
+            dcoord = dend['dcoord']
+            for xs, ys in zip(icoord, dcoord):
+                fig.add_trace(go.Scatter(
+                    x=xs,
+                    y=ys,
+                    mode='lines',
+                    line=dict(color='#667eea'),
+                    showlegend=False
+                ))
+
+            # Add x-axis labels
+            fig.update_layout(
+                title="Hierarchical Clustering Dendrogram",
+                xaxis=dict(
+                    ticktext=dend['ivl'],
+                    tickvals=list(range(5, len(dend['ivl']) * 10, 10)),
+                    tickangle=45,
+                    title="Product"
+                ),
+                yaxis_title="Distance",
+                height=500
+            )
+            figures["Dendrogram"] = fig
+            plt.close()
+        except Exception:
+            pass
+
+    return figures
+
+
+@router.get("/{run_id}/report")
+async def get_model_report(
+    run_id: str,
+    include_clustering: bool = Query(default=True, description="Include clustering analysis"),
+    n_clusters: Optional[int] = Query(default=None, ge=2, le=20, description="Number of clusters (None = auto-detect)"),
+    clustering_method: str = Query(default="kmeans", pattern="^(kmeans|hierarchical)$", description="Clustering method"),
+    max_k: int = Query(default=10, ge=2, le=20, description="Maximum k for auto-detection"),
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Generate an HTML report for a completed model run.
+
+    Returns a standalone HTML file with embedded interactive Plotly visualizations.
+
+    Query Parameters:
+    - include_clustering: Whether to include clustering analysis (default: True)
+    - n_clusters: Number of clusters (None = auto-detect optimal k)
+    - clustering_method: "kmeans" or "hierarchical"
+    - max_k: Maximum k to consider for auto-detection
+    """
+    # Get run from database
+    result = await session.execute(
+        select(ModelRun).where(ModelRun.id == run_id)
+    )
+    run = result.scalar_one_or_none()
+
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+
+    if run.status != ModelRunStatus.COMPLETED:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Run is not completed. Current status: {run.status.value}"
+        )
+
+    # Load results from pickle file
+    if not run.results_path:
+        raise HTTPException(status_code=404, detail="Results file not found")
+
+    results_path = Path(run.results_path)
+    if not results_path.exists():
+        raise HTTPException(status_code=404, detail="Results file not found on disk")
+
+    with open(results_path, "rb") as f:
+        results = pickle.load(f)
+
+    model_type = run.model_type.value if hasattr(run.model_type, 'value') else run.model_type
+    product_columns = run.product_columns or []
+
+    # Extract data from raw results (same logic as get_model_results endpoint)
+    extracted_data = _extract_report_data(results, model_type, product_columns)
+
+    # Generate figures using extracted data
+    figures = _generate_plotly_figures(extracted_data, model_type)
+
+    # Perform clustering and add clustering figures
+    clustering_result = None
+    if include_clustering:
+        clustering_result = _perform_clustering_for_report(
+            extracted_data,
+            n_clusters=n_clusters,
+            max_k=max_k,
+            method=clustering_method
+        )
+        if clustering_result is not None:
+            clustering_figures = _generate_clustering_figures(extracted_data, clustering_result)
+            figures.update(clustering_figures)
+
+    # Generate HTML report
+    html_content = _generate_html_report(run, results, figures, clustering_result)
+
+    # Return as downloadable HTML file
+    run_name = run.name or f"run_{run_id[:8]}"
+    filename = f"{run_name.replace(' ', '_')}_{model_type}_report.html"
+
+    return StreamingResponse(
+        io.BytesIO(html_content.encode('utf-8')),
+        media_type="text/html",
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )

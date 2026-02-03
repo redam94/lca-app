@@ -257,25 +257,32 @@ async def fit_nmf_with_progress(
 async def fit_mca_with_progress(
     data: np.ndarray,
     n_components: int = 5,
+    product_names: Optional[list] = None,
     progress_callback: Optional[Callable] = None,
 ) -> dict:
     """
     Async wrapper for MCA.
+
+    Args:
+        data: (n_households, n_products) binary purchase matrix
+        n_components: Number of MCA dimensions to extract
+        product_names: List of product names for labeling
+        progress_callback: Optional callback for progress updates
     """
     if not PRINCE_AVAILABLE:
         raise ImportError("MCA requires the 'prince' package to be installed")
-    
+
     def fit_with_callback():
         if progress_callback:
             progress_callback(iteration=0, log_likelihood=None, delta=None, extra={"status": "starting"})
-        
-        result = fit_mca(data, n_components=n_components)
-        
+
+        result = fit_mca(data, n_components=n_components, product_names=product_names)
+
         if progress_callback:
             progress_callback(iteration=1, log_likelihood=None, delta=None, extra={"status": "completed"})
-        
+
         return result
-    
+
     return await _run_in_executor(fit_with_callback)
 
 

@@ -879,6 +879,7 @@ async def fit_mca_task(
         result = await fit_mca_with_progress(
             X,
             n_components=params.get("n_components", 5),
+            product_names=product_columns,
             progress_callback=progress_callback,
         )
         

@@ -76,36 +76,72 @@ async def _get_worker_info(redis: aioredis.Redis) -> list[WorkerInfo]:
     workers = []
 
     try:
-        # ARQ workers register themselves with health check keys
-        # Pattern: arq:health:{worker_id}
-        health_keys = await redis.keys("arq:health:*")
+        # ARQ stores worker info at arq:worker:{worker_name} as a hash
+        # with fields: 'j' (jobs completed), 'f' (jobs failed), etc.
+        worker_keys = await redis.keys("arq:worker:*")
 
-        for key in health_keys:
-            worker_id = key.replace("arq:health:", "")
-            health_data = await redis.get(key)
+        for key in worker_keys:
+            worker_id = key.replace("arq:worker:", "")
+            worker_data = await redis.hgetall(key)
 
-            # Check if worker has a job in progress
-            in_progress_key = f"arq:in-progress:{worker_id}"
-            current_job = await redis.get(in_progress_key)
+            if worker_data:
+                # Parse worker data - ARQ uses short field names
+                jobs_completed = int(worker_data.get("j", 0))
+                jobs_failed = int(worker_data.get("f", 0))
 
-            workers.append(WorkerInfo(
-                worker_id=worker_id,
-                last_health_check=datetime.now(timezone.utc) if health_data else None,
-                jobs_completed=0,  # ARQ doesn't track this per-worker easily
-                jobs_failed=0,
-                current_job=current_job,
-            ))
+                workers.append(WorkerInfo(
+                    worker_id=worker_id,
+                    last_health_check=datetime.now(timezone.utc),
+                    jobs_completed=jobs_completed,
+                    jobs_failed=jobs_failed,
+                    current_job=None,
+                ))
 
-        # If no health keys found, check for any worker activity
+        # Check for health keys (alternative pattern)
         if not workers:
-            # Check for active job processing
-            in_progress_keys = await redis.keys("arq:in-progress:*")
-            for key in in_progress_keys:
-                worker_id = key.replace("arq:in-progress:", "")
-                current_job = await redis.get(key)
+            health_keys = await redis.keys("arq:health:*")
+            for key in health_keys:
+                worker_id = key.replace("arq:health:", "")
+                health_data = await redis.get(key)
+                workers.append(WorkerInfo(
+                    worker_id=worker_id,
+                    last_health_check=datetime.now(timezone.utc) if health_data else None,
+                    jobs_completed=0,
+                    jobs_failed=0,
+                    current_job=None,
+                ))
+
+        # Check for in-progress keys (workers currently processing)
+        in_progress_keys = await redis.keys("arq:in-progress:*")
+        for key in in_progress_keys:
+            # Try to associate with existing worker or create new entry
+            current_job = await redis.get(key)
+            worker_id = key.replace("arq:in-progress:", "")
+
+            # Update existing worker or add new one
+            found = False
+            for w in workers:
+                if w.worker_id == worker_id:
+                    w.current_job = current_job
+                    found = True
+                    break
+
+            if not found:
                 workers.append(WorkerInfo(
                     worker_id=worker_id,
                     current_job=current_job,
+                ))
+
+        # If still no workers but queue exists, indicate unknown worker
+        if not workers:
+            queue_exists = await redis.exists("arq:queue:default")
+            if queue_exists:
+                workers.append(WorkerInfo(
+                    worker_id="worker (idle)",
+                    last_health_check=None,
+                    jobs_completed=0,
+                    jobs_failed=0,
+                    current_job=None,
                 ))
     except Exception:
         pass

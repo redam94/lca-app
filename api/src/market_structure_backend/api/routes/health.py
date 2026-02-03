@@ -15,22 +15,37 @@ router = APIRouter(tags=["Health"])
 
 
 async def _count_active_workers(redis: aioredis.Redis) -> int:
-    """Count active ARQ workers by checking health and in-progress keys."""
+    """Count active ARQ workers by checking various ARQ key patterns."""
     try:
-        # Check for worker health keys (ARQ workers with health checks enabled)
+        # ARQ stores worker health at arq:worker:{worker_name} as a hash
+        # with fields like 'j' (jobs completed), 'f' (jobs failed), etc.
+        worker_keys = await redis.keys("arq:worker:*")
+        if worker_keys:
+            # Verify workers are active by checking their health data
+            active_count = 0
+            for key in worker_keys:
+                worker_data = await redis.hgetall(key)
+                if worker_data:
+                    active_count += 1
+            if active_count > 0:
+                return active_count
+
+        # Check for worker health keys (alternative pattern)
         health_keys = await redis.keys("arq:health:*")
         if health_keys:
             return len(health_keys)
 
-        # Fallback: check for in-progress keys (workers currently processing)
+        # Check for in-progress keys (workers currently processing jobs)
         in_progress_keys = await redis.keys("arq:in-progress:*")
         if in_progress_keys:
             return len(in_progress_keys)
 
-        # If no keys found but queue has jobs, assume at least 1 worker exists
-        queued = await redis.llen("arq:queue:default")
-        if queued > 0:
-            return 0  # Jobs queued but no worker detected
+        # Check if there's an active queue which implies a worker is connected
+        # ARQ creates a queue key when workers connect
+        queue_exists = await redis.exists("arq:queue:default")
+        if queue_exists:
+            # Queue exists, likely a worker is connected but idle
+            return 1
 
         return 0
     except Exception:
