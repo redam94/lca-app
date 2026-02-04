@@ -401,3 +401,163 @@ class ClusteringResponse(BaseModel):
     k_range: Optional[list[int]] = None
     # Cluster membership mapping
     cluster_members: Optional[dict[str, list[str]]] = None  # cluster_id -> list of products
+
+
+# =============================================================================
+# PRESENTATION SCHEMAS
+# =============================================================================
+
+class SlideTypeEnum(str, Enum):
+    """Available slide types."""
+    FIGURE = "figure"
+    TEXT = "text"
+    COMPARISON = "comparison"
+    SUMMARY = "summary"
+
+
+class FigureTypeEnum(str, Enum):
+    """Available figure types for presentation slides."""
+    SIMILARITY_MATRIX = "similarity_matrix"
+    VARIANCE_EXPLAINED = "variance_explained"
+    FACTOR_LOADINGS = "factor_loadings"
+    CLASS_PROFILES = "class_profiles"
+    BIPLOT = "biplot"
+    LCA_CLASS_BIPLOT = "lca_class_biplot"
+    TETRACHORIC = "tetrachoric"
+    ELBO_HISTORY = "elbo_history"
+    TOPIC_DISTRIBUTION = "topic_distribution"
+    NETWORK_MATRIX = "network_matrix"
+    DCM_COEFFICIENTS = "dcm_coefficients"
+    CLUSTERED_BIPLOT = "clustered_biplot"
+    SILHOUETTE_ANALYSIS = "silhouette_analysis"
+    CLUSTER_SIZES = "cluster_sizes"
+    DENDROGRAM = "dendrogram"
+
+
+class PresentationSlideCreate(BaseModel):
+    """Request to create a new presentation slide."""
+    title: str = Field(max_length=255, description="Slide title")
+    description: Optional[str] = Field(default=None, description="Slide description or commentary")
+    slide_type: SlideTypeEnum = Field(default=SlideTypeEnum.FIGURE, description="Type of slide")
+    model_run_id: Optional[str] = Field(default=None, description="Model run ID for figure slides")
+    figure_type: Optional[FigureTypeEnum] = Field(default=None, description="Type of figure to display")
+    figure_config: Optional[dict[str, Any]] = Field(default=None, description="Figure-specific configuration")
+    text_content: Optional[str] = Field(default=None, description="Markdown content for text slides")
+    layout: Optional[dict[str, Any]] = Field(default=None, description="Layout options")
+    order: Optional[int] = Field(default=None, description="Slide order (auto-assigned if not provided)")
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class PresentationSlideUpdate(BaseModel):
+    """Request to update an existing slide."""
+    title: Optional[str] = Field(default=None, max_length=255)
+    description: Optional[str] = None
+    slide_type: Optional[SlideTypeEnum] = None
+    model_run_id: Optional[str] = None
+    figure_type: Optional[FigureTypeEnum] = None
+    figure_config: Optional[dict[str, Any]] = None
+    text_content: Optional[str] = None
+    layout: Optional[dict[str, Any]] = None
+    order: Optional[int] = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class PresentationSlideResponse(BaseModel):
+    """Response schema for a presentation slide."""
+    id: str
+    presentation_id: str
+    order: int
+    title: str
+    description: Optional[str]
+    slide_type: SlideTypeEnum
+    model_run_id: Optional[str]
+    figure_type: Optional[FigureTypeEnum]
+    figure_config: Optional[dict[str, Any]]
+    text_content: Optional[str]
+    layout: Optional[dict[str, Any]]
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class BrandingOptions(BaseModel):
+    """Branding options for presentations."""
+    primary_color: Optional[str] = Field(default="#667eea", description="Primary theme color (hex)")
+    secondary_color: Optional[str] = Field(default="#764ba2", description="Secondary theme color (hex)")
+    logo_url: Optional[str] = Field(default=None, description="URL to logo image")
+    font_family: Optional[str] = Field(default=None, description="Custom font family")
+
+
+class PresentationCreate(BaseModel):
+    """Request to create a new presentation."""
+    name: str = Field(max_length=255, description="Presentation name")
+    description: Optional[str] = Field(default=None, description="Presentation description")
+    client_name: Optional[str] = Field(default=None, max_length=255, description="Client name for branding")
+    project_name: Optional[str] = Field(default=None, max_length=255, description="Project name for branding")
+    branding_options: Optional[BrandingOptions] = Field(default=None, description="Branding configuration")
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class PresentationUpdate(BaseModel):
+    """Request to update presentation metadata."""
+    name: Optional[str] = Field(default=None, max_length=255)
+    description: Optional[str] = None
+    client_name: Optional[str] = Field(default=None, max_length=255)
+    project_name: Optional[str] = Field(default=None, max_length=255)
+    branding_options: Optional[BrandingOptions] = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class PresentationResponse(BaseModel):
+    """Response schema for a presentation."""
+    id: str
+    name: str
+    description: Optional[str]
+    created_at: datetime
+    updated_at: datetime
+    client_name: Optional[str]
+    project_name: Optional[str]
+    branding_options: Optional[dict[str, Any]]
+    slides: list[PresentationSlideResponse]
+    slide_count: int
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class PresentationListResponse(BaseModel):
+    """Response for listing presentations."""
+    presentations: list[PresentationResponse]
+    total: int
+
+
+class SlideReorderRequest(BaseModel):
+    """Request to reorder slides."""
+    slide_ids: list[str] = Field(description="Ordered list of slide IDs")
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class FigureInfo(BaseModel):
+    """Information about an available figure type."""
+    type: FigureTypeEnum
+    name: str
+    description: str
+    available: bool = True
+
+
+class RunFiguresResponse(BaseModel):
+    """Available figures for a model run."""
+    model_run_id: str
+    model_type: ModelTypeEnum
+    product_columns: list[str]
+    available_figures: list[FigureInfo]
+
+
+class FigureDataResponse(BaseModel):
+    """Response containing figure data as Plotly JSON."""
+    model_run_id: str
+    figure_type: FigureTypeEnum
+    figure_json: dict[str, Any]  # Plotly figure as JSON

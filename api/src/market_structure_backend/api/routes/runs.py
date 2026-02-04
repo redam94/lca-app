@@ -918,6 +918,14 @@ def _extract_report_data(results: dict, model_type: str, product_columns: list) 
         if class_probs_raw is not None:
             extracted["class_probs"] = np.array(class_probs_raw)
             extracted["variance_explained"] = np.array(class_probs_raw) * 100
+        elif model_type == "lca_covariates":
+            # Fallback: compute mean class probs from per-household probs
+            # LCA with covariates returns class_probs_per_hh instead of global class_probs
+            class_probs_per_hh = results.get("class_probs_per_hh")
+            if class_probs_per_hh is not None:
+                mean_class_probs = np.array(class_probs_per_hh).mean(axis=0)
+                extracted["class_probs"] = mean_class_probs
+                extracted["variance_explained"] = mean_class_probs * 100
 
         # Residual correlations for similarity
         residual_corr = results.get("residual_correlations")
