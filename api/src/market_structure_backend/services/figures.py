@@ -478,18 +478,19 @@ def _generate_biplot(
         xaxis_title="Dimension 1",
         yaxis_title="Dimension 2",
         height=config.get("height", 600),
+        # Dropdown in TOP-RIGHT
         updatemenus=[
             dict(
                 active=0,
                 buttons=buttons,
                 direction="down",
                 showactive=True,
-                x=0.0,
-                xanchor="left",
+                x=1.0,
+                xanchor="right",
                 y=1.15,
                 yanchor="top"
             )
-        ]
+        ] if len(dim_pairs) > 1 else []
     )
     return fig
 

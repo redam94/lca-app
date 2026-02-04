@@ -1317,18 +1317,19 @@ def _generate_plotly_figures(extracted_data: dict, model_type: str) -> dict:
                 xaxis_title="Dimension 1",
                 yaxis_title="Dimension 2",
                 height=600,
+                # Dropdown in TOP-RIGHT
                 updatemenus=[
                     dict(
                         active=0,
                         buttons=buttons,
                         direction="down",
                         showactive=True,
-                        x=0.0,
-                        xanchor="left",
+                        x=1.0,
+                        xanchor="right",
                         y=1.15,
                         yanchor="top"
                     )
-                ]
+                ] if len(dim_pairs) > 1 else []
             )
             figures["Biplot"] = fig
 
@@ -1754,24 +1755,28 @@ def _generate_clustering_figures(
                     marker=dict(size=12, color=colors[cluster_id % len(colors)]),
                     name=f"Cluster {cluster_id + 1}",
                     legendgroup=f"cluster_{cluster_id}",
+                    # Show legend for first pair's traces, dropdown will toggle for other pairs
                     showlegend=pair_idx == 0,
                     visible=visible
                 ))
                 trace_count += 1
 
-        # Create dropdown buttons for dimension pairs
+        # Create dropdown buttons that also update showlegend for proper legend display
         buttons = []
         traces_per_pair = n_clusters
         for pair_idx, (dim_x, dim_y) in enumerate(dim_pairs):
             visibility = []
+            showlegend_values = []
             for p_idx in range(len(dim_pairs)):
                 for _ in range(traces_per_pair):
                     visibility.append(p_idx == pair_idx)
+                    # Show legend for the visible traces only
+                    showlegend_values.append(p_idx == pair_idx)
             buttons.append(dict(
                 label=f"Dim {dim_x+1} vs Dim {dim_y+1}",
                 method="update",
                 args=[
-                    {"visible": visibility},
+                    {"visible": visibility, "showlegend": showlegend_values},
                     {"xaxis.title": f"Dimension {dim_x+1}",
                      "yaxis.title": f"Dimension {dim_y+1}"}
                 ]
@@ -1782,14 +1787,25 @@ def _generate_clustering_figures(
             xaxis_title="Dimension 1",
             yaxis_title="Dimension 2",
             height=600,
+            # Legend to the RIGHT of the plot (outside)
+            legend=dict(
+                yanchor="top",
+                y=1.0,
+                xanchor="left",
+                x=1.02,
+                bgcolor="rgba(255,255,255,0.8)"
+            ),
+            # Add right margin to make room for legend
+            margin=dict(r=150),
+            # Dropdown in TOP-RIGHT
             updatemenus=[
                 dict(
                     active=0,
                     buttons=buttons,
                     direction="down",
                     showactive=True,
-                    x=0.0,
-                    xanchor="left",
+                    x=1.0,
+                    xanchor="right",
                     y=1.15,
                     yanchor="top"
                 )

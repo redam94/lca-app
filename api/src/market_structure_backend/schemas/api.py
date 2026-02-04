@@ -485,7 +485,9 @@ class BrandingOptions(BaseModel):
     """Branding options for presentations."""
     primary_color: Optional[str] = Field(default="#667eea", description="Primary theme color (hex)")
     secondary_color: Optional[str] = Field(default="#764ba2", description="Secondary theme color (hex)")
-    logo_url: Optional[str] = Field(default=None, description="URL to logo image")
+    logo_url: Optional[str] = Field(default=None, description="URL to logo image (deprecated, use client_logo_url)")
+    client_logo_url: Optional[str] = Field(default=None, description="URL to client logo image (bottom right of slides)")
+    agency_logo_url: Optional[str] = Field(default=None, description="URL to agency logo image (bottom right of slides, next to client logo)")
     font_family: Optional[str] = Field(default=None, description="Custom font family")
 
 
@@ -561,3 +563,86 @@ class FigureDataResponse(BaseModel):
     model_run_id: str
     figure_type: FigureTypeEnum
     figure_json: dict[str, Any]  # Plotly figure as JSON
+
+
+# =============================================================================
+# REVEAL.JS PRESENTATION SCHEMAS
+# =============================================================================
+
+class RevealThemeEnum(str, Enum):
+    """Available reveal.js themes."""
+    BLACK = "black"
+    WHITE = "white"
+    LEAGUE = "league"
+    BEIGE = "beige"
+    SKY = "sky"
+    NIGHT = "night"
+    SERIF = "serif"
+    SIMPLE = "simple"
+    SOLARIZED = "solarized"
+    MOON = "moon"
+    DRACULA = "dracula"
+    BLOOD = "blood"
+
+
+class RevealTransitionEnum(str, Enum):
+    """Available reveal.js transition effects."""
+    SLIDE = "slide"
+    FADE = "fade"
+    CONVEX = "convex"
+    CONCAVE = "concave"
+    ZOOM = "zoom"
+    NONE = "none"
+
+
+class SlideLayoutEnum(str, Enum):
+    """Available slide layout options."""
+    FULL = "full"              # Full slide figure
+    SPLIT_LEFT = "split_left"  # Figure left, text right
+    SPLIT_RIGHT = "split_right"  # Text left, figure right
+    TITLE = "title"            # Title slide
+    TWO_COLUMN = "two_column"  # Two figures side by side
+
+
+class ExportFormatEnum(str, Enum):
+    """Available presentation export formats."""
+    REVEALJS = "revealjs"
+    HTML = "html"
+
+
+class RevealJSBrandingOptions(BrandingOptions):
+    """Extended branding options with reveal.js-specific settings."""
+    theme: RevealThemeEnum = Field(default=RevealThemeEnum.WHITE, description="Reveal.js theme")
+    transition: RevealTransitionEnum = Field(default=RevealTransitionEnum.SLIDE, description="Slide transition effect")
+    slide_numbers: bool = Field(default=True, description="Show slide numbers")
+    progress_bar: bool = Field(default=True, description="Show progress bar")
+    controls: bool = Field(default=True, description="Show navigation controls")
+    center_content: bool = Field(default=True, description="Center slide content vertically")
+    auto_slide: Optional[int] = Field(default=None, description="Auto-advance interval in ms (None = disabled)")
+
+
+class SlideLayoutOptions(BaseModel):
+    """Per-slide layout and appearance options."""
+    layout: SlideLayoutEnum = Field(default=SlideLayoutEnum.FULL, description="Slide layout type")
+    background_color: Optional[str] = Field(default=None, description="Slide background color (hex)")
+    background_image: Optional[str] = Field(default=None, description="URL to background image")
+    background_opacity: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="Background opacity")
+    transition_override: Optional[RevealTransitionEnum] = Field(default=None, description="Override transition for this slide")
+    custom_css: Optional[str] = Field(default=None, description="Custom CSS for this slide")
+    text_color: Optional[str] = Field(default=None, description="Override text color (hex)")
+    fragment_animation: Optional[str] = Field(default=None, description="Fragment animation type")
+
+
+class SlidePreviewRequest(BaseModel):
+    """Request for single slide preview."""
+    slide_id: str = Field(description="ID of slide to preview")
+    theme: RevealThemeEnum = Field(default=RevealThemeEnum.WHITE, description="Preview theme")
+    primary_color: Optional[str] = Field(default="#667eea", description="Primary color")
+    secondary_color: Optional[str] = Field(default="#764ba2", description="Secondary color")
+
+
+class SlidePreviewResponse(BaseModel):
+    """Response containing single slide preview HTML."""
+    slide_id: str
+    html: str  # Standalone HTML for iframe embedding
+    theme: RevealThemeEnum

@@ -32,6 +32,9 @@ from ...schemas.api import (
     FigureInfo,
     FigureTypeEnum,
     SlideTypeEnum,
+    ExportFormatEnum,
+    RevealThemeEnum,
+    SlidePreviewResponse,
 )
 from ...services.figures import (
     get_available_figures,
@@ -549,11 +552,15 @@ async def get_figure_data(
 @router.get("/{presentation_id}/export")
 async def export_presentation(
     presentation_id: str,
+    format: ExportFormatEnum = Query(default=ExportFormatEnum.REVEALJS, description="Export format: revealjs (modern slide-based) or html (legacy scroll-based)"),
     session: AsyncSession = Depends(get_session),
 ):
-    """Export presentation as HTML."""
-    from ...services.presentation_generator import generate_presentation_html
+    """Export presentation as HTML.
 
+    Supports two formats:
+    - revealjs: Modern slide-based presentation with keyboard navigation (default)
+    - html: Legacy scroll-based HTML document
+    """
     stmt = (
         select(Presentation)
         .options(selectinload(Presentation.slides))
@@ -565,14 +572,21 @@ async def export_presentation(
     if not presentation:
         raise HTTPException(404, f"Presentation {presentation_id} not found")
 
-    # Generate HTML
+    # Generate HTML based on format
     try:
-        html_content = await generate_presentation_html(presentation, session)
+        if format == ExportFormatEnum.REVEALJS:
+            from ...services.presentation_generator_revealjs import generate_revealjs_presentation
+            html_content = await generate_revealjs_presentation(presentation, session)
+            suffix = "_slides"
+        else:
+            from ...services.presentation_generator import generate_presentation_html
+            html_content = await generate_presentation_html(presentation, session)
+            suffix = "_document"
     except Exception as e:
         raise HTTPException(500, f"Failed to generate presentation: {str(e)}")
 
     # Return as HTML file
-    filename = f"{presentation.name.replace(' ', '_')}_presentation.html"
+    filename = f"{presentation.name.replace(' ', '_')}{suffix}.html"
 
     return Response(
         content=html_content,
@@ -580,6 +594,53 @@ async def export_presentation(
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"'
         }
+    )
+
+
+# =============================================================================
+# SLIDE PREVIEW ENDPOINT
+# =============================================================================
+
+@router.get("/{presentation_id}/slides/{slide_id}/preview", response_model=SlidePreviewResponse)
+async def get_slide_preview(
+    presentation_id: str,
+    slide_id: str,
+    theme: RevealThemeEnum = Query(default=RevealThemeEnum.WHITE, description="Reveal.js theme for preview"),
+    primary_color: str = Query(default="#667eea", description="Primary brand color"),
+    secondary_color: str = Query(default="#764ba2", description="Secondary brand color"),
+    session: AsyncSession = Depends(get_session),
+):
+    """Get a standalone HTML preview for a single slide.
+
+    Returns HTML that can be embedded in an iframe for live preview during editing.
+    """
+    # Verify presentation exists
+    presentation = await session.get(Presentation, presentation_id)
+    if not presentation:
+        raise HTTPException(404, f"Presentation {presentation_id} not found")
+
+    # Get the slide
+    slide = await session.get(PresentationSlide, slide_id)
+    if not slide or slide.presentation_id != presentation_id:
+        raise HTTPException(404, f"Slide {slide_id} not found in presentation {presentation_id}")
+
+    # Generate single-slide preview
+    try:
+        from ...services.presentation_generator_revealjs import generate_single_slide_preview
+        html_content = await generate_single_slide_preview(
+            slide=slide,
+            session=session,
+            theme=theme.value,
+            primary_color=primary_color,
+            secondary_color=secondary_color,
+        )
+    except Exception as e:
+        raise HTTPException(500, f"Failed to generate slide preview: {str(e)}")
+
+    return SlidePreviewResponse(
+        slide_id=slide_id,
+        html=html_content,
+        theme=theme,
     )
 
 
