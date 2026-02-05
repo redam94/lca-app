@@ -182,7 +182,29 @@ def fit_network_analysis(data: np.ndarray, threshold: float = 0.1,
 
     # Compute centrality measures
     if G.number_of_edges() > 0:
-        eigenvector_centrality = nx.eigenvector_centrality_numpy(G, weight='weight')
+        # eigenvector_centrality_numpy doesn't give consistent results for
+        # disconnected graphs, so compute per connected component and combine
+        if nx.is_connected(G):
+            eigenvector_centrality = nx.eigenvector_centrality_numpy(G, weight='weight')
+        else:
+            eigenvector_centrality = {i: 0.0 for i in range(n_products)}
+            for component in nx.connected_components(G):
+                if len(component) < 2:
+                    continue
+                subgraph = G.subgraph(component)
+                try:
+                    sub_centrality = nx.eigenvector_centrality_numpy(subgraph, weight='weight')
+                    # Scale by component size relative to graph size so larger
+                    # components contribute more
+                    scale = len(component) / n_products
+                    for node, score in sub_centrality.items():
+                        eigenvector_centrality[node] = score * scale
+                except Exception:
+                    # Fallback: use degree centrality for this component
+                    sub_degree = nx.degree_centrality(subgraph)
+                    scale = len(component) / n_products
+                    for node, score in sub_degree.items():
+                        eigenvector_centrality[node] = score * scale
         degree_centrality = nx.degree_centrality(G)
         betweenness_centrality = nx.betweenness_centrality(G, weight='weight')
     else:

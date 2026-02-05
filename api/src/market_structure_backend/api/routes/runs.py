@@ -42,6 +42,37 @@ from ...workers import enqueue_job, TASK_REGISTRY
 router = APIRouter(prefix="/runs", tags=["Model Runs"])
 
 
+# Input data storage directory (data saved to disk before sending to worker)
+INPUT_DATA_DIR = Path("./model_results/input_data")
+INPUT_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _save_input_data(
+    run_id: str,
+    data: np.ndarray,
+    covariates: Optional[np.ndarray] = None,
+    covariate_columns: Optional[list[str]] = None,
+) -> str:
+    """
+    Save input data to disk before enqueuing to worker.
+
+    This avoids serializing large numpy arrays through Redis,
+    which can fail for large datasets due to memory limits.
+
+    Returns:
+        File path string to the saved input data.
+    """
+    data_path = INPUT_DATA_DIR / f"{run_id}_input.pkl"
+    payload = {"data": data}
+    if covariates is not None:
+        payload["covariates"] = covariates
+    if covariate_columns is not None:
+        payload["covariate_columns"] = covariate_columns
+    with open(data_path, "wb") as f:
+        pickle.dump(payload, f)
+    return str(data_path)
+
+
 # =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
@@ -190,38 +221,23 @@ async def submit_model_run(
         task_func = TASK_REGISTRY[model_type]
         task_name = task_func.__name__
 
-        # Build task arguments based on model type
-        if model_type == "lca_covariates":
-            await enqueue_job(
-                task_name,
-                run_id,
-                data.tolist(),
-                request.params,
-                product_columns,
-                covariates.tolist() if covariates is not None else None,
-                covariate_columns,
-                job_id=run_id,
-            )
-        elif model_type == "dcm" and covariates is not None:
-            # DCM can also use household features
-            await enqueue_job(
-                task_name,
-                run_id,
-                data.tolist(),
-                request.params,
-                product_columns,
-                covariates.tolist(),
-                job_id=run_id,
-            )
-        else:
-            await enqueue_job(
-                task_name,
-                run_id,
-                data.tolist(),
-                request.params,
-                product_columns,
-                job_id=run_id,
-            )
+        # Save input data to disk to avoid serializing large arrays through Redis
+        data_path = _save_input_data(
+            run_id,
+            data,
+            covariates=covariates if model_type in ["lca_covariates", "dcm"] else None,
+            covariate_columns=covariate_columns if model_type == "lca_covariates" else None,
+        )
+
+        # All model types use the same enqueue signature: (run_id, data_path, params, product_columns)
+        await enqueue_job(
+            task_name,
+            run_id,
+            data_path,
+            request.params,
+            product_columns,
+            job_id=run_id,
+        )
 
         # Update with job ID
         model_run.arq_job_id = run_id
@@ -395,6 +411,8 @@ async def get_model_results(
             item_probs = to_list(item_probs_raw)  # (n_classes, n_items)
             # Product embeddings = transpose of item_probs for biplot
             product_embeddings = to_list(item_probs_raw.T)
+            # Loadings = transposed item_probs (n_items, n_classes) for factor loadings heatmap
+            loadings = to_list(item_probs_raw.T)
 
         class_probs = to_list(results.get("class_probs"))
         household_embeddings = to_list(results.get("responsibilities"))
@@ -892,6 +910,7 @@ def _extract_report_data(results: dict, model_type: str, product_columns: list) 
     """
     extracted = {
         "product_columns": product_columns,
+        "model_type": model_type,
         "similarity_matrix": None,
         "loadings": None,
         "loadings_std": None,
@@ -903,6 +922,11 @@ def _extract_report_data(results: dict, model_type: str, product_columns: list) 
         "elbo_history": None,
         "topic_product_dist": None,
         "adjacency_matrix": None,
+        "communities": None,
+        "centrality_scores": None,
+        "degree_centrality": None,
+        "betweenness_centrality": None,
+        "edge_list": None,
         "alpha": None,
         "alpha_std": None,
     }
@@ -913,6 +937,7 @@ def _extract_report_data(results: dict, model_type: str, product_columns: list) 
         if item_probs_raw is not None:
             extracted["item_probs"] = np.array(item_probs_raw)
             extracted["product_embeddings"] = np.array(item_probs_raw).T
+            extracted["loadings"] = np.array(item_probs_raw).T  # (n_items, n_classes) for loadings heatmap
 
         class_probs_raw = results.get("class_probs")
         if class_probs_raw is not None:
@@ -1056,6 +1081,19 @@ def _extract_report_data(results: dict, model_type: str, product_columns: list) 
         if var_explained is not None:
             extracted["variance_explained"] = np.array(var_explained)
 
+        # Network-specific fields for graph and centrality figures
+        extracted["communities"] = results.get("communities")
+        cent = results.get("centrality_scores")
+        if cent is not None:
+            extracted["centrality_scores"] = np.array(cent)
+        deg = results.get("degree_centrality")
+        if deg is not None:
+            extracted["degree_centrality"] = np.array(deg)
+        betw = results.get("betweenness_centrality")
+        if betw is not None:
+            extracted["betweenness_centrality"] = np.array(betw)
+        extracted["edge_list"] = results.get("edge_list")
+
     return extracted
 
 
@@ -1123,12 +1161,21 @@ def _generate_plotly_figures(extracted_data: dict, model_type: str) -> dict:
         )
         figures["Variance Explained"] = fig
 
-    # Loadings Heatmap (factor-type models)
+    # Loadings Heatmap (factor-type models and LCA)
     loadings = extracted_data.get("loadings")
+    model_type = extracted_data.get("model_type", "")
     if loadings is not None and len(product_columns) > 0:
         if len(loadings.shape) == 2 and loadings.shape[0] == len(product_columns):
             n_factors = loadings.shape[1]
-            factor_names = [f"Factor {i+1}" for i in range(n_factors)]
+            # Use "Class" labels for LCA models, "Factor" for others
+            if model_type in ["lca", "lca_covariates"]:
+                factor_names = [f"Class {i+1}" for i in range(n_factors)]
+                loadings_title = "Class Loadings"
+                x_title = "Class"
+            else:
+                factor_names = [f"Factor {i+1}" for i in range(n_factors)]
+                loadings_title = "Factor Loadings"
+                x_title = "Factor"
             fig = go.Figure(data=go.Heatmap(
                 z=to_list(loadings),
                 x=factor_names,
@@ -1137,12 +1184,12 @@ def _generate_plotly_figures(extracted_data: dict, model_type: str) -> dict:
                 zmid=0
             ))
             fig.update_layout(
-                title="Factor Loadings",
-                xaxis_title="Factor",
+                title=loadings_title,
+                xaxis_title=x_title,
                 yaxis_title="Product",
                 height=max(400, len(product_columns) * 20)
             )
-            figures["Factor Loadings"] = fig
+            figures[loadings_title] = fig
 
     # LCA Class Profiles
     item_probs = extracted_data.get("item_probs")
@@ -1332,6 +1379,477 @@ def _generate_plotly_figures(extracted_data: dict, model_type: str) -> dict:
                 ] if len(dim_pairs) > 1 else []
             )
             figures["Biplot"] = fig
+
+    # Network Graph (for network models)
+    communities = extracted_data.get("communities")
+    centrality_scores_data = extracted_data.get("centrality_scores")
+    edge_list = extracted_data.get("edge_list")
+    if (communities is not None and centrality_scores_data is not None and
+            product_embeddings is not None and len(product_columns) > 0):
+        import plotly.express as px
+
+        n_prods = len(product_columns)
+        x_pos = product_embeddings[:, 0] if product_embeddings.shape[1] >= 1 else np.zeros(n_prods)
+        y_pos = product_embeddings[:, 1] if product_embeddings.shape[1] >= 2 else np.zeros(n_prods)
+
+        cent = np.array(centrality_scores_data)
+        if cent.max() > cent.min():
+            size_norm = (cent - cent.min()) / (cent.max() - cent.min())
+        else:
+            size_norm = np.ones(n_prods) * 0.5
+        node_sizes = 8 + size_norm * 22
+
+        n_comms = len(set(communities))
+        comm_colors = (px.colors.qualitative.Set1[:n_comms]
+                       if n_comms <= 9
+                       else px.colors.qualitative.Alphabet[:n_comms])
+
+        fig = go.Figure()
+
+        # Edges
+        if edge_list is not None:
+            for edge in edge_list:
+                src, tgt = edge[0], edge[1]
+                weight = edge[2] if len(edge) > 2 else 0.5
+                if src < n_prods and tgt < n_prods:
+                    fig.add_trace(go.Scatter(
+                        x=[float(x_pos[src]), float(x_pos[tgt]), None],
+                        y=[float(y_pos[src]), float(y_pos[tgt]), None],
+                        mode="lines",
+                        line=dict(width=max(0.5, float(weight) * 2), color="rgba(150,150,150,0.3)"),
+                        hoverinfo="skip", showlegend=False
+                    ))
+
+        # Nodes by community
+        for comm_id in range(n_comms):
+            mask = [i for i, c in enumerate(communities) if c == comm_id]
+            if not mask:
+                continue
+            hover_text = [
+                f"{product_columns[i]}<br>Community: {comm_id + 1}<br>Centrality: {float(cent[i]):.3f}"
+                for i in mask
+            ]
+            fig.add_trace(go.Scatter(
+                x=[float(x_pos[i]) for i in mask],
+                y=[float(y_pos[i]) for i in mask],
+                mode="markers+text",
+                text=[product_columns[i] for i in mask],
+                textposition="top center", textfont=dict(size=9),
+                hovertext=hover_text, hoverinfo="text",
+                marker=dict(
+                    size=[float(node_sizes[i]) for i in mask],
+                    color=comm_colors[comm_id % len(comm_colors)],
+                    line=dict(width=1, color="white")
+                ),
+                name=f"Community {comm_id + 1}"
+            ))
+
+        fig.update_layout(
+            title="Product Network Graph",
+            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False, title=""),
+            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False, title=""),
+            height=650, showlegend=True,
+            legend=dict(yanchor="top", y=1.0, xanchor="left", x=1.02, bgcolor="rgba(255,255,255,0.8)"),
+            margin=dict(r=150), plot_bgcolor="white"
+        )
+        figures["Network Graph"] = fig
+
+    # Centrality Comparison (for network models)
+    degree_cent = extracted_data.get("degree_centrality")
+    betweenness_cent = extracted_data.get("betweenness_centrality")
+    if (centrality_scores_data is not None and degree_cent is not None and
+            betweenness_cent is not None and len(product_columns) > 0):
+        eigenvector = np.array(centrality_scores_data)
+        degree_arr = np.array(degree_cent)
+        betweenness_arr = np.array(betweenness_cent)
+
+        # Sort by eigenvector centrality (ascending for horizontal bar)
+        sorted_idx = np.argsort(eigenvector)
+        sorted_products = [product_columns[i] for i in sorted_idx]
+
+        fig = go.Figure()
+        for name, vals, color in [
+            ("Eigenvector", eigenvector, "#667eea"),
+            ("Degree", degree_arr, "#764ba2"),
+            ("Betweenness", betweenness_arr, "#f5576c"),
+        ]:
+            fig.add_trace(go.Bar(
+                y=sorted_products,
+                x=[float(vals[i]) for i in sorted_idx],
+                orientation="h", name=name, marker_color=color
+            ))
+
+        fig.update_layout(
+            title="Centrality Comparison",
+            xaxis_title="Centrality Score",
+            yaxis_title="Product",
+            height=max(400, len(product_columns) * 25),
+            barmode="group", showlegend=True,
+            legend=dict(yanchor="top", y=1.0, xanchor="left", x=1.02, bgcolor="rgba(255,255,255,0.8)"),
+            margin=dict(r=150, l=max(80, max(len(p) for p in product_columns) * 7))
+        )
+        figures["Centrality Comparison"] = fig
+
+    # Top Products per Topic (for LDA models)
+    topic_dist_data = extracted_data.get("topic_product_dist")
+    if topic_dist_data is not None and len(product_columns) > 0:
+        n_topics = topic_dist_data.shape[0]
+        n_top = 15
+
+        fig = go.Figure()
+        for topic_idx in range(n_topics):
+            visible = topic_idx == 0
+            probs = topic_dist_data[topic_idx]
+            top_indices = np.argsort(probs)[::-1][:n_top]
+            top_indices = top_indices[::-1]  # Reverse for horizontal bar
+
+            top_prods = [product_columns[i] for i in top_indices]
+            top_probs = [float(probs[i]) for i in top_indices]
+
+            fig.add_trace(go.Bar(
+                y=top_prods, x=top_probs,
+                orientation="h", marker_color="#667eea",
+                name=f"Topic {topic_idx + 1}", visible=visible,
+                text=[f"{p:.3f}" for p in top_probs], textposition="outside"
+            ))
+
+        buttons = []
+        for topic_idx in range(n_topics):
+            visibility = [i == topic_idx for i in range(n_topics)]
+            buttons.append(dict(
+                label=f"Topic {topic_idx + 1}",
+                method="update",
+                args=[
+                    {"visible": visibility},
+                    {"title": f"Top {n_top} Products — Topic {topic_idx + 1}"}
+                ]
+            ))
+
+        fig.update_layout(
+            title=f"Top {n_top} Products — Topic 1",
+            xaxis_title="Probability", yaxis_title="Product",
+            height=max(400, n_top * 28), showlegend=False,
+            margin=dict(l=max(80, max(len(p) for p in product_columns) * 7)),
+            updatemenus=[
+                dict(
+                    active=0, buttons=buttons,
+                    direction="down", showactive=True,
+                    x=1.0, xanchor="right", y=1.15, yanchor="top"
+                )
+            ] if n_topics > 1 else []
+        )
+        figures["Top Products per Topic"] = fig
+
+    # Intertopic Distance Map (for LDA models, requires >= 2 topics)
+    if (topic_dist_data is not None and len(product_columns) > 0 and
+            topic_dist_data.shape[0] >= 2):
+        from scipy.spatial.distance import jensenshannon
+        from sklearn.manifold import MDS
+        import plotly.express as px
+
+        n_topics_map = topic_dist_data.shape[0]
+
+        # Pairwise Jensen-Shannon distance
+        dist_matrix = np.zeros((n_topics_map, n_topics_map))
+        for i in range(n_topics_map):
+            for j in range(i + 1, n_topics_map):
+                d = jensenshannon(topic_dist_data[i], topic_dist_data[j])
+                dist_matrix[i, j] = d
+                dist_matrix[j, i] = d
+
+        # MDS to 2D
+        if n_topics_map == 2:
+            coords = np.array([[-dist_matrix[0, 1] / 2, 0],
+                               [dist_matrix[0, 1] / 2, 0]])
+        else:
+            mds = MDS(n_components=2, dissimilarity='precomputed',
+                      random_state=42, normalized_stress='auto')
+            coords = mds.fit_transform(dist_matrix)
+
+        # Topic prevalence for sizing
+        var_exp = extracted_data.get("variance_explained")
+        if var_exp is not None and len(var_exp) == n_topics_map:
+            prevalence = np.array(var_exp)
+        else:
+            prevalence = np.ones(n_topics_map) * (100.0 / n_topics_map)
+
+        max_prev = prevalence.max() if prevalence.max() > 0 else 1.0
+        marker_sizes = 20 + (prevalence / max_prev) * 60
+
+        # Hover text with top 5 products
+        hover_texts = []
+        for t in range(n_topics_map):
+            probs = topic_dist_data[t]
+            top_idx = np.argsort(probs)[::-1][:5]
+            lines = [f"<b>Topic {t + 1}</b> ({prevalence[t]:.1f}%)", ""]
+            for idx in top_idx:
+                lines.append(f"{product_columns[idx]}: {probs[idx]:.3f}")
+            hover_texts.append("<br>".join(lines))
+
+        map_colors = (px.colors.qualitative.Set1[:n_topics_map]
+                      if n_topics_map <= 9
+                      else px.colors.qualitative.Alphabet[:n_topics_map])
+
+        fig = go.Figure()
+        for t in range(n_topics_map):
+            fig.add_trace(go.Scatter(
+                x=[float(coords[t, 0])],
+                y=[float(coords[t, 1])],
+                mode="markers+text",
+                text=[f"Topic {t + 1}"],
+                textposition="top center",
+                textfont=dict(size=11, color=map_colors[t % len(map_colors)]),
+                hovertext=hover_texts[t], hoverinfo="text",
+                marker=dict(
+                    size=float(marker_sizes[t]),
+                    color=map_colors[t % len(map_colors)],
+                    opacity=0.7,
+                    line=dict(width=2, color="white")
+                ),
+                name=f"Topic {t + 1} ({prevalence[t]:.1f}%)"
+            ))
+
+        fig.update_layout(
+            title="Intertopic Distance Map",
+            xaxis=dict(
+                title="MDS Dimension 1", showgrid=True,
+                gridcolor="rgba(200,200,200,0.3)",
+                zeroline=True, zerolinecolor="rgba(150,150,150,0.5)"
+            ),
+            yaxis=dict(
+                title="MDS Dimension 2", showgrid=True,
+                gridcolor="rgba(200,200,200,0.3)",
+                zeroline=True, zerolinecolor="rgba(150,150,150,0.5)"
+            ),
+            height=600, showlegend=True,
+            legend=dict(yanchor="top", y=1.0, xanchor="left", x=1.02,
+                        bgcolor="rgba(255,255,255,0.8)"),
+            margin=dict(r=180), plot_bgcolor="white"
+        )
+        figures["Intertopic Distance Map"] = fig
+
+    # =========================================================================
+    # Stakeholder-friendly competitive landscape figures (cross-model)
+    # =========================================================================
+
+    # --- Closest Competitors ---
+    similarity = extracted_data.get("similarity_matrix")
+    if similarity is not None and len(product_columns) > 1:
+        n_prods = len(product_columns)
+        pairs = []
+        for i in range(n_prods):
+            for j in range(i + 1, n_prods):
+                score = float(similarity[i, j])
+                if score > 0:
+                    pairs.append((product_columns[i], product_columns[j], score))
+        pairs.sort(key=lambda x: x[2], reverse=True)
+        top_pairs = pairs[:15]
+        if top_pairs:
+            top_pairs = top_pairs[::-1]
+            labels_p = [f"{a} ↔ {b}" for a, b, _ in top_pairs]
+            scores_p = [s for _, _, s in top_pairs]
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                y=labels_p, x=scores_p, orientation="h",
+                marker=dict(color=scores_p, colorscale="Blues", cmin=0),
+                text=[f"{s:.1%}" for s in scores_p], textposition="outside",
+            ))
+            max_lbl = max(len(l) for l in labels_p)
+            fig.update_layout(
+                title="Closest Competitors",
+                xaxis_title="Competitive Similarity", yaxis_title="",
+                height=max(400, len(top_pairs) * 32),
+                margin=dict(l=max(120, max_lbl * 6)),
+                xaxis=dict(tickformat=".0%"),
+            )
+            figures["Closest Competitors"] = fig
+
+    # --- Market Map ---
+    if (product_embeddings is not None and len(product_columns) > 0 and
+            len(product_embeddings.shape) == 2 and product_embeddings.shape[1] >= 2):
+        import plotly.express as px_mm
+
+        n_prods = len(product_columns)
+        x_map = product_embeddings[:, 0]
+        y_map = product_embeddings[:, 1]
+
+        # Importance from similarity
+        if similarity is not None:
+            sim_abs = np.abs(np.array(similarity))
+            np.fill_diagonal(sim_abs, 0)
+            imp = sim_abs.mean(axis=1)
+        else:
+            imp = np.ones(n_prods) * 0.5
+        imp_min, imp_max = imp.min(), imp.max()
+        if imp_max > imp_min:
+            sz = 10 + ((imp - imp_min) / (imp_max - imp_min)) * 30
+        else:
+            sz = np.ones(n_prods) * 20
+
+        # Groups from loadings
+        ldg = extracted_data.get("loadings")
+        if ldg is not None and len(ldg.shape) == 2 and ldg.shape[1] >= 1:
+            grp = np.argmax(np.abs(ldg), axis=1)
+            n_g = int(grp.max()) + 1
+        else:
+            grp = np.zeros(n_prods, dtype=int)
+            n_g = 1
+        mm_colors = (px_mm.colors.qualitative.Set2[:n_g]
+                     if n_g <= 8 else px_mm.colors.qualitative.Alphabet[:n_g])
+
+        fig = go.Figure()
+        for gid in range(n_g):
+            mask = [i for i in range(n_prods) if grp[i] == gid]
+            if not mask:
+                continue
+            fig.add_trace(go.Scatter(
+                x=[float(x_map[i]) for i in mask],
+                y=[float(y_map[i]) for i in mask],
+                mode="markers+text",
+                text=[product_columns[i] for i in mask],
+                textposition="top center", textfont=dict(size=10),
+                hovertext=[
+                    f"<b>{product_columns[i]}</b><br>Group: {gid+1}<br>Importance: {imp[i]:.1%}"
+                    for i in mask
+                ],
+                hoverinfo="text",
+                marker=dict(size=[float(sz[i]) for i in mask],
+                            color=mm_colors[gid % len(mm_colors)],
+                            opacity=0.8, line=dict(width=1, color="white")),
+                name=f"Group {gid + 1}",
+            ))
+        fig.update_layout(
+            title="Market Map: Competitive Landscape",
+            xaxis=dict(title="", showgrid=True, gridcolor="rgba(200,200,200,0.3)",
+                       zeroline=False, showticklabels=False),
+            yaxis=dict(title="", showgrid=True, gridcolor="rgba(200,200,200,0.3)",
+                       zeroline=False, showticklabels=False),
+            height=650, showlegend=True, legend=dict(title="Product Groups"),
+            plot_bgcolor="white",
+            annotations=[dict(
+                text="Products closer together compete more directly. "
+                     "Larger circles = more central to the market.",
+                xref="paper", yref="paper", x=0.5, y=-0.06,
+                showarrow=False, font=dict(size=10, color="gray"))],
+        )
+        figures["Market Map"] = fig
+
+    # --- Product Scorecard ---
+    if similarity is not None and len(product_columns) > 1:
+        import plotly.express as px_sc
+
+        n_prods = len(product_columns)
+        sim_sc = np.array(similarity)
+        np.fill_diagonal(sim_sc, 0)
+        imp_sc = np.abs(sim_sc).mean(axis=1)
+
+        # Groups from loadings
+        ldg = extracted_data.get("loadings")
+        if ldg is not None and len(ldg.shape) == 2 and ldg.shape[1] >= 1:
+            grp = np.argmax(np.abs(ldg), axis=1)
+            n_g = int(grp.max()) + 1
+        else:
+            grp = np.zeros(n_prods, dtype=int)
+            n_g = 1
+        sc_colors = (px_sc.colors.qualitative.Set2[:n_g]
+                     if n_g <= 8 else px_sc.colors.qualitative.Alphabet[:n_g])
+
+        sorted_idx = np.argsort(imp_sc)
+
+        # Top 3 competitors per product
+        top3_sc = {}
+        for i in range(n_prods):
+            row = sim_sc[i].copy()
+            row[i] = -np.inf
+            t3 = np.argsort(row)[::-1][:3]
+            top3_sc[i] = [(product_columns[j], float(row[j])) for j in t3 if row[j] > 0]
+
+        fig = go.Figure()
+        for gid in range(n_g):
+            mask = [i for i in sorted_idx if grp[i] == gid]
+            if not mask:
+                continue
+            hover = []
+            for i in mask:
+                lines = [f"<b>{product_columns[i]}</b>",
+                         f"Importance: {imp_sc[i]:.3f}", f"Group: {gid+1}", "",
+                         "<b>Top Competitors:</b>"]
+                for rk, (cn, cs) in enumerate(top3_sc.get(i, []), 1):
+                    lines.append(f"  {rk}. {cn} ({cs:.1%})")
+                hover.append("<br>".join(lines))
+            fig.add_trace(go.Bar(
+                y=[product_columns[i] for i in mask],
+                x=[float(imp_sc[i]) for i in mask],
+                orientation="h", name=f"Group {gid + 1}",
+                marker_color=sc_colors[gid % len(sc_colors)],
+                hovertext=hover, hoverinfo="text",
+            ))
+
+        fig.update_layout(
+            title="Product Competitive Scorecard",
+            xaxis_title="Market Importance Score", yaxis_title="",
+            barmode="relative", height=max(400, n_prods * 24),
+            margin=dict(l=max(100, max(len(p) for p in product_columns) * 7)),
+            showlegend=True, legend=dict(title="Product Groups"),
+            yaxis=dict(categoryorder="array",
+                       categoryarray=[product_columns[i] for i in sorted_idx]),
+        )
+        figures["Product Scorecard"] = fig
+
+    # --- Market Segments (Treemap) ---
+    ldg_seg = extracted_data.get("loadings")
+    if (ldg_seg is not None and len(ldg_seg.shape) == 2 and
+            ldg_seg.shape[1] >= 1 and len(product_columns) > 0):
+        import plotly.express as px_seg
+
+        n_prods = len(product_columns)
+        n_groups_seg = ldg_seg.shape[1]
+        grp_seg = np.argmax(np.abs(ldg_seg), axis=1)
+        seg_colors = (px_seg.colors.qualitative.Set2[:n_groups_seg]
+                      if n_groups_seg <= 8
+                      else px_seg.colors.qualitative.Alphabet[:n_groups_seg])
+        var_exp_seg = extracted_data.get("variance_explained")
+
+        tm_labels = ["Market"]
+        tm_parents = [""]
+        tm_values = [0]
+        tm_colors = ["#ffffff"]
+        tm_hover = ["Full market structure"]
+
+        for gid in range(n_groups_seg):
+            gprods = [i for i in range(n_prods) if grp_seg[i] == gid]
+            gname = f"Segment {gid + 1}"
+            if var_exp_seg is not None and gid < len(var_exp_seg):
+                share = f"{float(var_exp_seg[gid]):.1f}%"
+            else:
+                share = f"{len(gprods)} products"
+
+            tm_labels.append(gname)
+            tm_parents.append("Market")
+            tm_values.append(0)
+            tm_colors.append(seg_colors[gid % len(seg_colors)])
+            tm_hover.append(f"<b>{gname}</b><br>Products: {len(gprods)}<br>Share: {share}")
+
+            for pi in gprods:
+                fit = float(np.abs(ldg_seg[pi, gid]))
+                tm_labels.append(product_columns[pi])
+                tm_parents.append(gname)
+                tm_values.append(max(fit, 0.01))
+                tm_colors.append(seg_colors[gid % len(seg_colors)])
+                tm_hover.append(
+                    f"<b>{product_columns[pi]}</b><br>Segment: {gname}<br>Fit: {fit:.3f}")
+
+        fig = go.Figure(go.Treemap(
+            labels=tm_labels, parents=tm_parents, values=tm_values,
+            marker=dict(colors=tm_colors, line=dict(width=2, color="white")),
+            hovertext=tm_hover, hoverinfo="text", textinfo="label",
+            textfont=dict(size=12), branchvalues="remainder",
+        ))
+        fig.update_layout(
+            title="Market Segments: Natural Product Groupings",
+            height=600, margin=dict(t=50, l=10, r=10, b=30),
+        )
+        figures["Market Segments"] = fig
 
     return figures
 

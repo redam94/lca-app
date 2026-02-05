@@ -74,13 +74,33 @@ async def _update_run_status(
 async def _save_results(run_id: str, results: dict) -> str:
     """Save full results to disk and return the path."""
     results_path = RESULTS_DIR / f"{run_id}.pkl"
-    
+
     # Convert numpy arrays to lists for JSON serialization in summary
     # Keep original arrays in pickle for full results
     with open(results_path, "wb") as f:
         pickle.dump(results, f)
-    
+
     return str(results_path)
+
+
+def _load_input_data(data_path: str) -> dict:
+    """
+    Load input data from disk (saved by the API before enqueuing).
+
+    Returns dict with 'data' key (numpy array) and optionally
+    'covariates' and 'covariate_columns' keys.
+    """
+    with open(data_path, "rb") as f:
+        payload = pickle.load(f)
+    return payload
+
+
+def _cleanup_input_data(data_path: str):
+    """Remove input data file after task completes."""
+    try:
+        Path(data_path).unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def _numpy_to_list(obj: Any) -> Any:
@@ -173,26 +193,26 @@ def _create_results_summary(results: dict, model_type: str) -> dict:
 async def fit_lca_task(
     ctx: dict,
     run_id: str,
-    data: list[list[float]],
+    data_path: str,
     params: dict,
     product_columns: list[str],
 ):
     """
     ARQ task for fitting Latent Class Analysis.
-    
+
     Args:
         ctx: ARQ context with session_factory and settings from worker startup
         run_id: Model run ID
-        data: Purchase data matrix (n_households x n_products)
+        data_path: Path to pickled input data file
         params: LCA parameters (n_classes, max_iter, n_init)
         product_columns: Product column names
     """
     # Get resources from context (initialized at worker startup)
     settings = _get_settings(ctx)
     session_factory = _get_session_factory(ctx)
-    
+
     tracker = await ProgressTracker.create(settings.redis_url)
-    
+
     try:
         # Update status to RUNNING
         await _update_run_status(
@@ -200,9 +220,10 @@ async def fit_lca_task(
             started_at=datetime.now(timezone.utc)
         )
         await tracker.start_tracking(run_id)
-        
-        # Convert data to numpy array
-        X = np.array(data)
+
+        # Load data from disk
+        payload = _load_input_data(data_path)
+        X = np.array(payload["data"])
         
         # Import the model fitting function
         from .model_implementations import fit_lca_with_progress
@@ -267,11 +288,12 @@ async def fit_lca_task(
         )
         
         await tracker.fail(run_id, error_msg)
-        
+
         return {"status": "failed", "run_id": run_id, "error": error_msg}
-    
+
     finally:
         await tracker.close()
+        _cleanup_input_data(data_path)
 
 
 # =============================================================================
@@ -281,11 +303,9 @@ async def fit_lca_task(
 async def fit_lca_covariates_task(
     ctx: dict,
     run_id: str,
-    data: list[list[float]],
+    data_path: str,
     params: dict,
     product_columns: list[str],
-    covariates: Optional[list[list[float]]] = None,
-    covariate_columns: Optional[list[str]] = None,
 ):
     """
     ARQ task for fitting Latent Class Analysis with household covariates.
@@ -293,11 +313,9 @@ async def fit_lca_covariates_task(
     Args:
         ctx: ARQ context with session_factory and settings from worker startup
         run_id: Model run ID
-        data: Purchase data matrix (n_households x n_products)
+        data_path: Path to pickled input data file
         params: LCA parameters (n_classes, max_iter, n_init)
         product_columns: Product column names
-        covariates: Household covariate matrix (n_households x n_features)
-        covariate_columns: Covariate column names
     """
     # Get resources from context (initialized at worker startup)
     settings = _get_settings(ctx)
@@ -313,8 +331,12 @@ async def fit_lca_covariates_task(
         )
         await tracker.start_tracking(run_id)
 
-        # Convert data to numpy arrays
-        X = np.array(data)
+        # Load data from disk
+        payload = _load_input_data(data_path)
+        X = np.array(payload["data"])
+
+        covariates = payload.get("covariates")
+        covariate_columns = payload.get("covariate_columns")
 
         if covariates is None or len(covariates) == 0:
             raise ValueError("LCA with covariates requires covariate data")
@@ -407,6 +429,7 @@ async def fit_lca_covariates_task(
 
     finally:
         await tracker.close()
+        _cleanup_input_data(data_path)
 
 
 # =============================================================================
@@ -416,7 +439,7 @@ async def fit_lca_covariates_task(
 async def fit_bayesian_factor_pymc_task(
     ctx: dict,
     run_id: str,
-    data: list[list[float]],
+    data_path: str,
     params: dict,
     product_columns: list[str],
 ):
@@ -442,7 +465,8 @@ async def fit_bayesian_factor_pymc_task(
         )
         await tracker.start_tracking(run_id)
         
-        X = np.array(data)
+        payload = _load_input_data(data_path)
+        X = np.array(payload["data"])
         
         from .model_implementations import fit_bayesian_factor_pymc_with_progress
         
@@ -521,6 +545,7 @@ async def fit_bayesian_factor_pymc_task(
     
     finally:
         await tracker.close()
+        _cleanup_input_data(data_path)
 
 
 # =============================================================================
@@ -530,10 +555,9 @@ async def fit_bayesian_factor_pymc_task(
 async def fit_dcm_task(
     ctx: dict,
     run_id: str,
-    data: list[list[float]],
+    data_path: str,
     params: dict,
     product_columns: list[str],
-    household_features: Optional[list[list[float]]] = None,
 ):
     """ARQ task for fitting Discrete Choice Model."""
     # Get resources from context
@@ -549,8 +573,10 @@ async def fit_dcm_task(
         )
         await tracker.start_tracking(run_id)
         
-        X = np.array(data)
-        hh_features = np.array(household_features) if household_features else None
+        payload = _load_input_data(data_path)
+        X = np.array(payload["data"])
+        household_features_raw = payload.get("covariates")
+        hh_features = np.array(household_features_raw) if household_features_raw is not None else None
         
         from .model_implementations import fit_dcm_with_progress
         
@@ -623,6 +649,7 @@ async def fit_dcm_task(
     
     finally:
         await tracker.close()
+        _cleanup_input_data(data_path)
 
 
 # =============================================================================
@@ -632,7 +659,7 @@ async def fit_dcm_task(
 async def fit_factor_tetrachoric_task(
     ctx: dict,
     run_id: str,
-    data: list[list[float]],
+    data_path: str,
     params: dict,
     product_columns: list[str],
 ):
@@ -650,7 +677,8 @@ async def fit_factor_tetrachoric_task(
         )
         await tracker.start_tracking(run_id)
         
-        X = np.array(data)
+        payload = _load_input_data(data_path)
+        X = np.array(payload["data"])
         
         from .model_implementations import fit_factor_tetrachoric_with_progress
         
@@ -697,12 +725,13 @@ async def fit_factor_tetrachoric_task(
         return {"status": "failed", "run_id": run_id, "error": error_msg}
     finally:
         await tracker.close()
+        _cleanup_input_data(data_path)
 
 
 async def fit_nmf_task(
     ctx: dict,
     run_id: str,
-    data: list[list[float]],
+    data_path: str,
     params: dict,
     product_columns: list[str],
 ):
@@ -720,7 +749,8 @@ async def fit_nmf_task(
         )
         await tracker.start_tracking(run_id)
         
-        X = np.array(data)
+        payload = _load_input_data(data_path)
+        X = np.array(payload["data"])
         
         from .model_implementations import fit_nmf_with_progress
         
@@ -771,12 +801,13 @@ async def fit_nmf_task(
         return {"status": "failed", "run_id": run_id, "error": error_msg}
     finally:
         await tracker.close()
+        _cleanup_input_data(data_path)
 
 
 async def fit_bayesian_vi_task(
     ctx: dict,
     run_id: str,
-    data: list[list[float]],
+    data_path: str,
     params: dict,
     product_columns: list[str],
 ):
@@ -794,7 +825,8 @@ async def fit_bayesian_vi_task(
         )
         await tracker.start_tracking(run_id)
         
-        X = np.array(data)
+        payload = _load_input_data(data_path)
+        X = np.array(payload["data"])
         
         from .model_implementations import fit_bayesian_vi_with_progress
         
@@ -841,12 +873,13 @@ async def fit_bayesian_vi_task(
         return {"status": "failed", "run_id": run_id, "error": error_msg}
     finally:
         await tracker.close()
+        _cleanup_input_data(data_path)
 
 
 async def fit_mca_task(
     ctx: dict,
     run_id: str,
-    data: list[list[float]],
+    data_path: str,
     params: dict,
     product_columns: list[str],
 ):
@@ -864,7 +897,8 @@ async def fit_mca_task(
         )
         await tracker.start_tracking(run_id)
         
-        X = np.array(data)
+        payload = _load_input_data(data_path)
+        X = np.array(payload["data"])
         
         from .model_implementations import fit_mca_with_progress
         
@@ -917,6 +951,7 @@ async def fit_mca_task(
         return {"status": "failed", "run_id": run_id, "error": error_msg}
     finally:
         await tracker.close()
+        _cleanup_input_data(data_path)
 
 
 # =============================================================================
@@ -926,7 +961,7 @@ async def fit_mca_task(
 async def fit_lda_task(
     ctx: dict,
     run_id: str,
-    data: list[list[float]],
+    data_path: str,
     params: dict,
     product_columns: list[str],
 ):
@@ -936,7 +971,7 @@ async def fit_lda_task(
     Args:
         ctx: ARQ context with session_factory and settings from worker startup
         run_id: Model run ID
-        data: Purchase data matrix (n_households x n_products)
+        data_path: Path to pickled input data file
         params: LDA parameters (n_topics, max_iter, learning_method)
         product_columns: Product column names
     """
@@ -953,7 +988,8 @@ async def fit_lda_task(
         )
         await tracker.start_tracking(run_id)
 
-        X = np.array(data)
+        payload = _load_input_data(data_path)
+        X = np.array(payload["data"])
 
         from .model_implementations import fit_lda_with_progress
 
@@ -1008,6 +1044,7 @@ async def fit_lda_task(
         return {"status": "failed", "run_id": run_id, "error": error_msg}
     finally:
         await tracker.close()
+        _cleanup_input_data(data_path)
 
 
 # =============================================================================
@@ -1017,7 +1054,7 @@ async def fit_lda_task(
 async def fit_network_task(
     ctx: dict,
     run_id: str,
-    data: list[list[float]],
+    data_path: str,
     params: dict,
     product_columns: list[str],
 ):
@@ -1027,7 +1064,7 @@ async def fit_network_task(
     Args:
         ctx: ARQ context with session_factory and settings from worker startup
         run_id: Model run ID
-        data: Purchase data matrix (n_households x n_products)
+        data_path: Path to pickled input data file
         params: Network parameters (threshold, community_method, edge_method)
         product_columns: Product column names
     """
@@ -1044,7 +1081,8 @@ async def fit_network_task(
         )
         await tracker.start_tracking(run_id)
 
-        X = np.array(data)
+        payload = _load_input_data(data_path)
+        X = np.array(payload["data"])
 
         from .model_implementations import fit_network_with_progress
 
@@ -1101,6 +1139,7 @@ async def fit_network_task(
         return {"status": "failed", "run_id": run_id, "error": error_msg}
     finally:
         await tracker.close()
+        _cleanup_input_data(data_path)
 
 
 # =============================================================================

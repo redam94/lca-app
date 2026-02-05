@@ -432,6 +432,15 @@ class FigureTypeEnum(str, Enum):
     SILHOUETTE_ANALYSIS = "silhouette_analysis"
     CLUSTER_SIZES = "cluster_sizes"
     DENDROGRAM = "dendrogram"
+    NETWORK_GRAPH = "network_graph"
+    CENTRALITY_COMPARISON = "centrality_comparison"
+    TOP_PRODUCTS_TOPIC = "top_products_topic"
+    INTERTOPIC_DISTANCE_MAP = "intertopic_distance_map"
+    CLOSEST_COMPETITORS = "closest_competitors"
+    MARKET_MAP = "market_map"
+    PRODUCT_SCORECARD = "product_scorecard"
+    PRODUCT_NEIGHBORHOOD = "product_neighborhood"
+    MARKET_SEGMENTS = "market_segments"
 
 
 class PresentationSlideCreate(BaseModel):
